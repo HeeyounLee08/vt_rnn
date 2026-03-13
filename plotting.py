@@ -10,6 +10,8 @@ Generates:
 
 import numpy as np
 import matplotlib.pyplot as plt
+from matplotlib.gridspec import GridSpec
+from scipy.ndimage import gaussian_filter1d
 from typing import Dict
 from pathlib import Path
 
@@ -17,8 +19,22 @@ import torch
 from models import MODEL_COLORS
 from izhikevich_configs import index_to_name
 
-PLOT_ROOT = Path(__file__).parent / 'plots'
+PLOT_ROOT = Path(__file__).parent / 'results'
 PLOT_ROOT.mkdir(exist_ok=True)
+
+plt.rcParams.update({
+    'font.family': 'sans-serif',
+    'font.size': 9,
+    'axes.spines.top': False,
+    'axes.spines.right': False,
+    'axes.labelsize': 9,
+    'axes.titlesize': 10,
+    'xtick.labelsize': 8,
+    'ytick.labelsize': 8,
+    'legend.fontsize': 8,
+    'legend.framealpha': 0.7,
+    'figure.dpi': 150,
+})
 
 
 def get_plot_dir(cell_type: int, plot_root: Path = None) -> Path:
@@ -167,8 +183,9 @@ def plot_tau_distributions(trainers: Dict, cell_type: int, plot_root: Path = Non
         model = trainer.model
         ax.set_title(name, fontsize=10)
 
-        if name == 'VanillaRNN':
-            ax.text(0.5, 0.5, 'No τ\n(discrete RNN)', ha='center', va='center',
+        if name in ('VanillaRNN', 'PLRNN'):
+            label = 'No τ\n(discrete RNN)' if name == 'VanillaRNN' else 'No τ\n(diagonal A)'
+            ax.text(0.5, 0.5, label, ha='center', va='center',
                     transform=ax.transAxes, fontsize=12, color='gray')
             ax.set_axis_off()
 
@@ -185,23 +202,35 @@ def plot_tau_distributions(trainers: Dict, cell_type: int, plot_root: Path = Non
             with torch.no_grad():
                 alpha = model.get_alpha().cpu().numpy()
             taus = model.dt / alpha
-            ax.hist(taus, bins=20, color=color, alpha=0.8, edgecolor='k', lw=0.5)
-            ax.axvline(taus.mean(), color='k', ls='--', lw=1.2,
-                       label=f'mean={taus.mean():.1f}ms')
-            ax.set_xlabel('τ (ms)')
-            ax.set_ylabel('# units')
-            ax.legend(fontsize=8)
+            taus = taus[np.isfinite(taus)]
+            if len(taus) == 0:
+                ax.text(0.5, 0.5, 'No finite τ', ha='center', va='center',
+                        transform=ax.transAxes, fontsize=12, color='gray')
+                ax.set_axis_off()
+            else:
+                ax.hist(taus, bins=20, color=color, alpha=0.8, edgecolor='k', lw=0.5)
+                ax.axvline(taus.mean(), color='k', ls='--', lw=1.2,
+                           label=f'mean={taus.mean():.1f}ms')
+                ax.set_xlabel('τ (ms)')
+                ax.set_ylabel('# units')
+                ax.legend(fontsize=8)
             ax.set_title(f'{name}\n[τ_min={model.tau_min}, τ_max={model.tau_max}]', fontsize=9)
 
         elif name == 'FixedSpectrum':
             alpha = model.alpha.cpu().numpy()
             taus = model.dt / alpha
-            ax.hist(taus, bins=20, color=color, alpha=0.8, edgecolor='k', lw=0.5)
-            ax.axvline(taus.mean(), color='k', ls='--', lw=1.2,
-                       label=f'mean={taus.mean():.1f}ms')
-            ax.set_xlabel('τ (ms)')
-            ax.set_ylabel('# units')
-            ax.legend(fontsize=8)
+            taus = taus[np.isfinite(taus)]
+            if len(taus) == 0:
+                ax.text(0.5, 0.5, 'No finite τ', ha='center', va='center',
+                        transform=ax.transAxes, fontsize=12, color='gray')
+                ax.set_axis_off()
+            else:
+                ax.hist(taus, bins=20, color=color, alpha=0.8, edgecolor='k', lw=0.5)
+                ax.axvline(taus.mean(), color='k', ls='--', lw=1.2,
+                           label=f'mean={taus.mean():.1f}ms')
+                ax.set_xlabel('τ (ms)')
+                ax.set_ylabel('# units')
+                ax.legend(fontsize=8)
             ax.set_title(f'{name}\n[log-normal, fixed]', fontsize=9)
 
         elif name == 'Partitioned':
@@ -259,16 +288,30 @@ def plot_hidden_activations(trainer, I_binned: np.ndarray, y_binned: np.ndarray,
     with torch.no_grad():
         y_pred, h_seq = model(X_t, return_sequence=True, return_hidden=True)
         y_pred = y_pred.squeeze(0).cpu().numpy()
+        y_pred = np.clip(np.nan_to_num(y_pred, nan=0.0, posinf=1e6), 0, 1e6)
         h_seq = h_seq.squeeze(0).cpu().numpy()  # (seq_len, hidden_size)
 
-    act = np.abs(np.tanh(h_seq))  # (seq_len, hidden_size), values in [0, 1]
+    act_name = getattr(model, 'activation_name', 'tanh')
+    view = getattr(model, 'view', 'membrane_potential')
+    if view == 'firing_rate':
+        act = h_seq  # already post-activation
+    elif act_name == 'relu':
+        act = np.maximum(0, h_seq)
+    else:
+        act = np.tanh(h_seq)  # values in [-1, 1]
 
-    # Sorting logic
-    if model_name == 'VanillaRNN':
-        sort_idx = np.argsort(act.var(axis=0))
+    # Sorting logic — retain metric for side panel
+    if model_name in ('VanillaRNN', 'PLRNN'):
+        variances = act.var(axis=0)
+        sort_idx = np.argsort(variances)
+        metric = variances[sort_idx]
+        xlabel = 'Variance'
         ylabel = 'Unit (sorted by variance)'
     elif model_name == 'Clockwork':
-        sort_idx = np.argsort(model.unit_periods.cpu().numpy())
+        periods = model.unit_periods.cpu().numpy()
+        sort_idx = np.argsort(periods)
+        metric = periods[sort_idx].astype(float)
+        xlabel = 'Period'
         ylabel = 'Unit (sorted by period)'
     else:
         if hasattr(model, 'get_alpha'):
@@ -278,47 +321,166 @@ def plot_hidden_activations(trainer, I_binned: np.ndarray, y_binned: np.ndarray,
             alpha = model.alpha.cpu().numpy()
         taus = model.dt / alpha
         sort_idx = np.argsort(taus)
+        metric = taus[sort_idx]
+        xlabel = 'Tau (ms)'
         ylabel = 'Unit (sorted by τ)'
 
     sorted_act = act[:, sort_idx]  # (seq_len, hidden_size)
+    n_units = sorted_act.shape[1]
     t = np.arange(len(I_binned))
     color = MODEL_COLORS.get(model_name, 'gray')
 
-    fig, axes = plt.subplots(3, 1, figsize=(14, 6),
-                             gridspec_kw={'height_ratios': [1, 3, 1]})
+    # 3-column GridSpec:
+    #   col 0: timescale side panel (heatmap row only)
+    #   col 1: all three time-aligned panels (sharex keeps them locked)
+    #   col 2: colorbar (heatmap row only) — dedicated column avoids squishing col 1
+    fig = plt.figure(figsize=(14, 6), constrained_layout=True)
+    gs = GridSpec(3, 3, figure=fig,
+                  height_ratios=[1, 3, 1],
+                  width_ratios=[1, 6, 0.12])
 
-    # --- Top: stimulus ---
-    axes[0].plot(t, I_binned, color='cornflowerblue', lw=1.2)
-    axes[0].set_ylabel('Input', fontsize=8)
-    axes[0].set_xlim(0, len(t) - 1)
-    axes[0].set_xticks([])
-    axes[0].grid(alpha=0.2)
+    ax_side    = fig.add_subplot(gs[1, 0])
+    ax_stim    = fig.add_subplot(gs[0, 1])
+    ax_heatmap = fig.add_subplot(gs[1, 1], sharex=ax_stim)
+    ax_out     = fig.add_subplot(gs[2, 1], sharex=ax_stim)
+    ax_cbar    = fig.add_subplot(gs[1, 2])
 
-    # --- Middle: heatmap ---
-    im = axes[1].imshow(sorted_act.T, aspect='auto', origin='lower',
-                        cmap='magma', vmin=0, vmax=1,
-                        extent=[0, len(t) - 1, 0, sorted_act.shape[1]])
-    axes[1].set_ylabel(ylabel, fontsize=8)
-    axes[1].set_xticks([])
-    fig.colorbar(im, ax=axes[1], fraction=0.02, pad=0.01, label='|tanh(h)|')
+    # --- Side panel (timescales) ---
+    y_coords = np.arange(n_units)
+    ax_side.set_ylim(-0.5, n_units - 0.5)
+    ax_side.set_yticks([])
+    ax_side.set_ylabel(ylabel, fontsize=8)
+    if model_name in ('VanillaRNN', 'PLRNN'):
+        ax_side.set_axis_off()
+    else:
+        ax_side.fill_betweenx(y_coords, 0, metric, color='gray', alpha=0.6)
+        ax_side.plot(metric, y_coords, color='k', lw=1)
+        ax_side.set_xlabel(xlabel, fontsize=8)
+        ax_side.tick_params(axis='x', labelsize=7)
+        ax_side.set_xscale('log')
+        ax_side.spines['left'].set_visible(False)
+        ax_side.grid(axis='x', alpha=0.2)
 
-    # --- Bottom: GT spikes + predicted rate ---
+    # --- Top: stimulus (no x-axis) ---
+    ax_stim.plot(t, I_binned, color='cornflowerblue', lw=1.2)
+    ax_stim.set_ylabel('Input', fontsize=8)
+    ax_stim.set_xlim(0, len(t) - 1)
+    ax_stim.spines['bottom'].set_visible(False)
+    ax_stim.tick_params(bottom=False, labelbottom=False)
+    ax_stim.grid(axis='y', alpha=0.2)
+
+    # --- Middle: heatmap (no x-axis) ---
+    if act_name == 'relu':
+        vmax_act = np.percentile(sorted_act, 99) or 1.0
+        im = ax_heatmap.imshow(sorted_act.T, aspect='auto', origin='lower',
+                               cmap='magma', vmin=0, vmax=vmax_act,
+                               extent=[0, len(t) - 1, -0.5, n_units - 0.5])
+        cbar_label = 'ReLU(h)'
+    else:
+        im = ax_heatmap.imshow(sorted_act.T, aspect='auto', origin='lower',
+                               cmap='RdBu_r', vmin=-1, vmax=1,
+                               extent=[0, len(t) - 1, -0.5, n_units - 0.5])
+        cbar_label = 'tanh(h)'
+    ax_heatmap.set_ylim(-0.5, n_units - 0.5)
+    ax_heatmap.set_yticks([])
+    ax_heatmap.spines['bottom'].set_visible(False)
+    ax_heatmap.tick_params(bottom=False, labelbottom=False)
+    fig.colorbar(im, cax=ax_cbar, label=cbar_label)
+
+    # --- Bottom: GT spikes + predicted spikes + rate ---
     gt_times = np.where(y_binned > 0)[0]
-    axes[2].vlines(gt_times, 0, 1, color='k', lw=1.0, alpha=0.7)
-    ax2r = axes[2].twinx()
-    ax2r.plot(t, y_pred, color=color, lw=1.2, alpha=0.7)
-    ax2r.set_ylabel('Rate', fontsize=8)
-    ax2r.set_ylim(bottom=0)
-    axes[2].set_ylim(0, 1.5)
-    axes[2].set_yticks([])
-    axes[2].set_xlabel('Time (bins)')
-    axes[2].set_xlim(0, len(t) - 1)
-    axes[2].grid(alpha=0.2)
+    pred_times = np.where(np.random.poisson(y_pred) > 0)[0]
+    ax_out.vlines(gt_times,   1.1, 1.9, color='k',    lw=1.2)
+    ax_out.vlines(pred_times, 0.1, 0.9, color=color,  lw=1.2, alpha=0.8)
+    ax_out.set_yticks([0.5, 1.5])
+    ax_out.set_yticklabels(['Pred', 'GT'], fontsize=8)
+    ax_out_r = ax_out.twinx()
+    gt_smooth = gaussian_filter1d(y_binned.astype(float), sigma=1)
+    ax_out_r.plot(t, gt_smooth, color='k', lw=1.2, alpha=0.55, linestyle='-',
+                  label='GT (smoothed)')
+    ax_out_r.plot(t, y_pred, color=color, lw=1.2, alpha=0.5, linestyle='--',
+                  label='Predicted')
+    ax_out_r.set_ylabel('Rate', fontsize=8)
+    ax_out_r.set_ylim(bottom=0)
+    ax_out_r.spines['top'].set_visible(False)
+    ax_out_r.legend(fontsize=7, loc='upper right')
+    ax_out.set_ylim(0, 2)
+    ax_out.set_xlabel('Time (bins)')
+    ax_out.grid(axis='x', alpha=0.2)
 
     fig.suptitle(f'{model_name} — Hidden Activations (Cell Type {cell_type})',
                  fontweight='bold')
-    plt.tight_layout()
     _save(fig, get_plot_dir(cell_type, plot_root) / f'hidden_heatmap_{model_name}.png')
+
+
+def _collect_isis(y_spikes: np.ndarray) -> np.ndarray:
+    """ISIs (in bins) from a spike train; handles multi-spike bins by repeating."""
+    spike_times = np.repeat(np.arange(len(y_spikes)), y_spikes.astype(int))
+    if len(spike_times) < 2:
+        return np.array([])
+    return np.diff(spike_times).astype(float)
+
+
+_ISI_HATCHES = ['///', '\\\\\\', '|||', '---', 'xxx', '+++', 'ooo', '...']
+
+
+def plot_isi_distributions(trainers: Dict, test_trials: list,
+                           cell_type: int, plot_root: Path = None):
+    """
+    ISI distribution: ground truth vs all models, across all test trials.
+    Linear x-axis, fine bins, transparent hatched bars, color-coded per model.
+    """
+    gt_isis = np.concatenate([_collect_isis(yb) for _, yb in test_trials])
+    gt_isis = gt_isis[gt_isis > 0]
+
+    model_isis = {}
+    for name, trainer in trainers.items():
+        segs = []
+        for I_binned, _ in test_trials:
+            y_pred = trainer.predict(I_binned.reshape(1, -1, 1))[0]
+            y_sampled = np.random.poisson(y_pred)
+            seg = _collect_isis(y_sampled)
+            if len(seg):
+                segs.append(seg)
+        model_isis[name] = np.concatenate(segs) if segs else np.array([])
+
+    all_vals = np.concatenate([gt_isis] + [v for v in model_isis.values() if len(v)])
+    all_vals = all_vals[all_vals > 0]
+    if len(all_vals) < 2:
+        return
+
+    x_max = np.percentile(all_vals, 98)
+    bins = np.linspace(0, x_max, 80)
+
+    fig, ax = plt.subplots(figsize=(10, 5))
+
+    if len(gt_isis) >= 2:
+        ax.hist(gt_isis, bins=bins, density=True,
+                color='#333333', alpha=0.30, hatch='',
+                edgecolor='#333333', linewidth=1.2,
+                label=f'Ground Truth (n={len(gt_isis)})',
+                zorder=len(trainers) + 2)
+
+    for i, (name, isis) in enumerate(model_isis.items()):
+        color = MODEL_COLORS.get(name, 'gray')
+        hatch = _ISI_HATCHES[i % len(_ISI_HATCHES)]
+        if len(isis) >= 2:
+            ax.hist(isis, bins=bins, density=True,
+                    color=color, alpha=0.35, hatch=hatch,
+                    edgecolor=color, linewidth=0.6,
+                    label=f'{name} (n={len(isis)})',
+                    zorder=i + 1)
+
+    ax.set_xlim(0, x_max)
+    ax.set_xlabel('ISI (bins)', fontsize=10)
+    ax.set_ylabel('Density', fontsize=10)
+    ax.set_title(f'ISI Distribution — Cell Type {cell_type}', fontsize=11, fontweight='bold')
+    ax.legend(ncol=2, fontsize=7, framealpha=0.85, loc='upper right')
+    ax.grid(alpha=0.25, axis='y')
+    ax.spines['top'].set_visible(False)
+    ax.spines['right'].set_visible(False)
+    plt.tight_layout()
+    _save(fig, get_plot_dir(cell_type, plot_root) / 'isi_distributions.png')
 
 
 def plot_clean_comparison(trainers: Dict, I_binned: np.ndarray,
