@@ -1,15 +1,21 @@
 """
 models.py - RNN architectures for fitting Izhikevich neuron dynamics.
 
-Four models, all with 1 layer, 64 hidden units, tanh activation:
-1. VanillaRNN         - Standard Elman RNN (nn.RNN baseline)
-2. LearnableTauCTRNN  - CTRNN with learnable time constants via sigmoid reparameterization
-3. FixedSpectrumCTRNN - CTRNN with fixed log-normal timescale distribution
-4. PartitionedCTRNN   - CTRNN with explicit fast/slow compartments
+Models (all with configurable activation: tanh or relu):
+1. VanillaRNN               - Standard Elman RNN
+2. LearnableTauCTRNN        - CTRNN with learnable time constants
+3. FixedSpectrumCTRNN       - CTRNN with fixed log-normal timescale distribution
+4. PartitionedCTRNN         - CTRNN with explicit fast/slow compartments
+5. MultiPartitionedCTRNN    - CTRNN with N equally-sized compartments
+6. LearnablePartitionedCTRNN - CTRNN with learnable fast/slow partitions
+7. ClockworkRNN             - Clockwork RNN (Koutnik et al. 2014)
+8. PLRNN                    - Piecewise-Linear RNN (Durstewitz 2017)
 
-All CTRNN variants implement the Euler-discretized leaky integrator:
-    h[t] = (1 - alpha) * h[t-1] + alpha * (g * W_rec @ tanh(h[t-1]) + W_in @ x[t] + b)
-where alpha = dt / tau controls each unit's integration rate.
+Two hidden-state views (selectable via `view` parameter):
+  membrane_potential: nonlinearity on recurrent input only; state integrates linearly
+  firing_rate:        nonlinearity wraps the full update; state is always post-activation
+
+Clockwork and PLRNN have fixed membrane_potential semantics and ignore the view flag.
 """
 
 import math
@@ -27,6 +33,15 @@ from typing import Optional
 class _BaseRNNMixin:
     """Shared components: learnable h0, Linear -> Softplus readout with negative bias."""
 
+    def _init_activation(self, activation_name: str):
+        self.activation_name = activation_name.lower()
+        if self.activation_name == 'relu':
+            self.act_fn = torch.relu
+        elif self.activation_name == 'tanh':
+            self.act_fn = torch.tanh
+        else:
+            raise ValueError(f"Unsupported activation: {activation_name}")
+
     def _init_shared(self, hidden_size: int):
         self.h0 = nn.Parameter(torch.zeros(hidden_size))
         self.fc = nn.Linear(hidden_size, 1)
@@ -42,28 +57,59 @@ class _BaseRNNMixin:
         else:
             return self.softplus(self.fc(h_seq[:, -1, :])).squeeze(-1)
 
+    def _ctrnn_step(self, h, x_t, alpha):
+        """Single CTRNN Euler step, dispatched by self.view."""
+        if self.view == 'firing_rate':
+            pre = self.g * self.W_rec(h) + self.W_in(x_t) + self.bias
+            return self.act_fn((1 - alpha) * h + alpha * pre)
+        # membrane_potential (default)
+        drive = self.g * self.W_rec(self.act_fn(h)) + self.W_in(x_t) + self.bias
+        return (1 - alpha) * h + alpha * drive
+
 
 # =============================================================================
 # 1. Vanilla RNN (baseline)
 # =============================================================================
 
 class VanillaRNN(nn.Module, _BaseRNNMixin):
-    """Standard Elman RNN with tanh nonlinearity, using nn.RNN."""
+    """
+    Standard Elman RNN with configurable view.
+      membrane_potential: h = W_in x + W_rec act(h) + b
+      firing_rate:        h = act(W_in x + W_rec h + b)
+    """
 
-    def __init__(self, input_size: int = 1, hidden_size: int = 64):
+    def __init__(self, input_size: int = 1, hidden_size: int = 64,
+                 activation: str = 'tanh', view: str = 'membrane_potential', **kwargs):
         super().__init__()
         self.hidden_size = hidden_size
-        self.rnn = nn.RNN(input_size, hidden_size, num_layers=1,
-                          batch_first=True, nonlinearity='tanh')
+        self.view = view
+        self._init_activation(activation)
+        self.W_in = nn.Linear(input_size, hidden_size, bias=False)
+        self.W_rec = nn.Linear(hidden_size, hidden_size, bias=False)
+        self.bias = nn.Parameter(torch.zeros(hidden_size))
         self._init_shared(hidden_size)
+        self._init_weights()
+
+    def _init_weights(self):
+        std = 1.0 / math.sqrt(self.hidden_size)
+        nn.init.normal_(self.W_in.weight, 0, std)
+        nn.init.normal_(self.W_rec.weight, 0, std)
 
     def forward(self, x: torch.Tensor, return_sequence: bool = True,
                 return_hidden: bool = False) -> torch.Tensor:
-        h0_batch = self._get_h0(x.shape[0]).unsqueeze(0).contiguous()
-        out, _ = self.rnn(x, h0_batch)
-        readout = self._readout(out, return_sequence)
+        batch_size, seq_len, _ = x.shape
+        h = self._get_h0(batch_size)
+        h_seq = []
+        for t in range(seq_len):
+            if self.view == 'firing_rate':
+                h = self.act_fn(self.W_in(x[:, t, :]) + self.W_rec(h) + self.bias)
+            else:
+                h = self.W_in(x[:, t, :]) + self.W_rec(self.act_fn(h)) + self.bias
+            h_seq.append(h)
+        h_seq_tensor = torch.stack(h_seq, dim=1)
+        readout = self._readout(h_seq_tensor, return_sequence)
         if return_hidden:
-            return readout, out
+            return readout, h_seq_tensor
         return readout
 
 
@@ -81,17 +127,17 @@ class LearnableTauCTRNN(nn.Module, _BaseRNNMixin):
 
     def __init__(self, input_size: int = 1, hidden_size: int = 64,
                  dt: float = 1.0, tau_min: float = 1.0, tau_max: float = 200.0,
-                 g: float = 1.5):
+                 g: float = 1.5, activation: str = 'tanh',
+                 view: str = 'membrane_potential'):
         super().__init__()
         self.hidden_size = hidden_size
         self.dt = dt
         self.tau_min = tau_min
         self.tau_max = tau_max
         self.g = g
+        self.view = view
+        self._init_activation(activation)
 
-        # Learnable unconstrained timescale parameter.
-        # Init via logit of Uniform(eps, 1-eps) so taus start uniformly spread
-        # across [tau_min, tau_max] rather than collapsed near the midpoint.
         eps = 0.05
         u = torch.empty(hidden_size).uniform_(eps, 1.0 - eps)
         self.rho = nn.Parameter(torch.log(u / (1.0 - u)))
@@ -103,13 +149,10 @@ class LearnableTauCTRNN(nn.Module, _BaseRNNMixin):
         self._init_weights()
 
     def _init_weights(self):
-        # Initialize with standard deviation 1/sqrt(N)
         nn.init.normal_(self.W_rec.weight, 0, 1.0 / math.sqrt(self.hidden_size))
-        # ... and keep the self.g multiplier in the forward pass.
         nn.init.normal_(self.W_in.weight, 0, 1.0 / math.sqrt(self.hidden_size))
 
     def get_alpha(self) -> torch.Tensor:
-
         tau = self.tau_min + torch.sigmoid(self.rho) * (self.tau_max - self.tau_min)
         return self.dt / tau
 
@@ -120,8 +163,7 @@ class LearnableTauCTRNN(nn.Module, _BaseRNNMixin):
         alpha = self.get_alpha()
         h_seq = []
         for t in range(seq_len):
-            drive = self.g * self.W_rec(torch.tanh(h)) + self.W_in(x[:, t, :]) + self.bias
-            h = (1 - alpha) * h + alpha * drive
+            h = self._ctrnn_step(h, x[:, t, :], alpha)
             h_seq.append(h)
 
         h_seq_tensor = torch.stack(h_seq, dim=1)
@@ -145,18 +187,19 @@ class FixedSpectrumCTRNN(nn.Module, _BaseRNNMixin):
 
     def __init__(self, input_size: int = 1, hidden_size: int = 64,
                  dt: float = 1.0, tau_mean: float = 10.0, tau_std: float = 5.0,
-                 g: float = 1.5):
+                 g: float = 1.5, activation: str = 'tanh',
+                 view: str = 'membrane_potential'):
         super().__init__()
         self.hidden_size = hidden_size
         self.dt = dt
         self.g = g
+        self.view = view
+        self._init_activation(activation)
 
-        # Compute log-normal parameters from desired mean/std
         var = tau_std ** 2
         mu = math.log(tau_mean ** 2 / math.sqrt(var + tau_mean ** 2))
         sigma = math.sqrt(math.log(1 + var / tau_mean ** 2))
 
-        # Sample tau, compute alpha, register as non-learnable buffer
         tau = torch.empty(hidden_size).log_normal_(mean=mu, std=sigma)
         alpha = torch.clamp(dt / tau, min=1e-4, max=1.0)
         self.register_buffer('alpha', alpha)
@@ -168,9 +211,7 @@ class FixedSpectrumCTRNN(nn.Module, _BaseRNNMixin):
         self._init_weights()
 
     def _init_weights(self):
-        # Initialize with standard deviation 1/sqrt(N)
         nn.init.normal_(self.W_rec.weight, 0, 1.0 / math.sqrt(self.hidden_size))
-        # ... and keep the self.g multiplier in the forward pass.
         nn.init.normal_(self.W_in.weight, 0, 1.0 / math.sqrt(self.hidden_size))
 
     def forward(self, x: torch.Tensor, return_sequence: bool = True,
@@ -179,8 +220,7 @@ class FixedSpectrumCTRNN(nn.Module, _BaseRNNMixin):
         h = self._get_h0(batch_size)
         h_seq = []
         for t in range(seq_len):
-            drive = self.g * self.W_rec(torch.tanh(h)) + self.W_in(x[:, t, :]) + self.bias
-            h = (1 - self.alpha) * h + self.alpha * drive
+            h = self._ctrnn_step(h, x[:, t, :], self.alpha)
             h_seq.append(h)
 
         h_seq_tensor = torch.stack(h_seq, dim=1)
@@ -204,15 +244,17 @@ class PartitionedCTRNN(nn.Module, _BaseRNNMixin):
 
     def __init__(self, input_size: int = 1, hidden_size: int = 64,
                  dt: float = 1.0, tau_fast: float = 2.0, tau_slow: float = 50.0,
-                 fast_ratio: float = 0.5, g: float = 1.5):
+                 fast_ratio: float = 0.5, g: float = 1.5, activation: str = 'tanh',
+                 view: str = 'membrane_potential'):
         super().__init__()
         self.hidden_size = hidden_size
         self.dt = dt
         self.g = g
         self.n_fast = int(hidden_size * fast_ratio)
         self.n_slow = hidden_size - self.n_fast
+        self.view = view
+        self._init_activation(activation)
 
-        # Build alpha vector: [fast_units | slow_units]
         alpha = torch.cat([
             torch.full((self.n_fast,), dt / tau_fast),
             torch.full((self.n_slow,), dt / tau_slow),
@@ -227,9 +269,7 @@ class PartitionedCTRNN(nn.Module, _BaseRNNMixin):
         self._init_weights()
 
     def _init_weights(self):
-        # Initialize with standard deviation 1/sqrt(N)
         nn.init.normal_(self.W_rec.weight, 0, 1.0 / math.sqrt(self.hidden_size))
-        # ... and keep the self.g multiplier in the forward pass.
         nn.init.normal_(self.W_in.weight, 0, 1.0 / math.sqrt(self.hidden_size))
 
     def forward(self, x: torch.Tensor, return_sequence: bool = True,
@@ -239,8 +279,7 @@ class PartitionedCTRNN(nn.Module, _BaseRNNMixin):
 
         h_seq = []
         for t in range(seq_len):
-            drive = self.g * self.W_rec(torch.tanh(h)) + self.W_in(x[:, t, :]) + self.bias
-            h = (1 - self.alpha) * h + self.alpha * drive
+            h = self._ctrnn_step(h, x[:, t, :], self.alpha)
             h_seq.append(h)
 
         h_seq_tensor = torch.stack(h_seq, dim=1)
@@ -265,18 +304,19 @@ class MultiPartitionedCTRNN(nn.Module, _BaseRNNMixin):
     def __init__(self, input_size: int = 1, hidden_size: int = 64,
                  dt: float = 1.0,
                  taus: tuple = (2.0, 25.0, 50.0, 75.0, 100.0),
-                 g: float = 1.5):
+                 g: float = 1.5, activation: str = 'tanh',
+                 view: str = 'membrane_potential'):
         super().__init__()
         self.hidden_size = hidden_size
         self.dt = dt
         self.g = g
         self.taus = taus
+        self.view = view
+        self._init_activation(activation)
 
-        # Divide units as evenly as possible across compartments
         n = len(taus)
         base, remainder = divmod(hidden_size, n)
         sizes = [base + 1 if i < remainder else base for i in range(n)]
-        # For 64 units and 5 taus, sizes becomes: [13, 13, 13, 13, 12]
         self.sizes = sizes
 
         alpha = torch.cat([
@@ -293,9 +333,7 @@ class MultiPartitionedCTRNN(nn.Module, _BaseRNNMixin):
         self._init_weights()
 
     def _init_weights(self):
-        # Initialize with standard deviation 1/sqrt(N)
         nn.init.normal_(self.W_rec.weight, 0, 1.0 / math.sqrt(self.hidden_size))
-        # ... and keep the self.g multiplier in the forward pass.
         nn.init.normal_(self.W_in.weight, 0, 1.0 / math.sqrt(self.hidden_size))
 
     def forward(self, x: torch.Tensor, return_sequence: bool = True,
@@ -305,8 +343,7 @@ class MultiPartitionedCTRNN(nn.Module, _BaseRNNMixin):
 
         h_seq = []
         for t in range(seq_len):
-            drive = self.g * self.W_rec(torch.tanh(h)) + self.W_in(x[:, t, :]) + self.bias
-            h = (1 - self.alpha) * h + self.alpha * drive
+            h = self._ctrnn_step(h, x[:, t, :], self.alpha)
             h_seq.append(h)
 
         h_seq_tensor = torch.stack(h_seq, dim=1)
@@ -330,7 +367,8 @@ class LearnablePartitionedCTRNN(nn.Module, _BaseRNNMixin):
     def __init__(self, input_size: int = 1, hidden_size: int = 64,
                  dt: float = 1.0, tau_min: float = 1.0, tau_max: float = 200.0,
                  init_tau_fast: float = 2.0, init_tau_slow: float = 50.0,
-                 fast_ratio: float = 0.5, g: float = 1.5):
+                 fast_ratio: float = 0.5, g: float = 1.5, activation: str = 'tanh',
+                 view: str = 'membrane_potential'):
         super().__init__()
         self.hidden_size = hidden_size
         self.dt = dt
@@ -339,8 +377,9 @@ class LearnablePartitionedCTRNN(nn.Module, _BaseRNNMixin):
         self.g = g
         self.n_fast = int(hidden_size * fast_ratio)
         self.n_slow = hidden_size - self.n_fast
+        self.view = view
+        self._init_activation(activation)
 
-        # Initialise rho via logit so that sigmoid(rho) maps to the target tau
         def _tau_to_rho(tau):
             p = (tau - tau_min) / (tau_max - tau_min)
             return math.log(p / (1 - p))
@@ -355,9 +394,7 @@ class LearnablePartitionedCTRNN(nn.Module, _BaseRNNMixin):
         self._init_weights()
 
     def _init_weights(self):
-        # Initialize with standard deviation 1/sqrt(N)
         nn.init.normal_(self.W_rec.weight, 0, 1.0 / math.sqrt(self.hidden_size))
-        # ... and keep the self.g multiplier in the forward pass.
         nn.init.normal_(self.W_in.weight, 0, 1.0 / math.sqrt(self.hidden_size))
 
     def get_alpha(self) -> torch.Tensor:
@@ -375,8 +412,7 @@ class LearnablePartitionedCTRNN(nn.Module, _BaseRNNMixin):
 
         h_seq = []
         for t in range(seq_len):
-            drive = self.g * self.W_rec(torch.tanh(h)) + self.W_in(x[:, t, :]) + self.bias
-            h = (1 - alpha) * h + alpha * drive
+            h = self._ctrnn_step(h, x[:, t, :], alpha)
             h_seq.append(h)
 
         h_seq_tensor = torch.stack(h_seq, dim=1)
@@ -392,25 +428,28 @@ class LearnablePartitionedCTRNN(nn.Module, _BaseRNNMixin):
 
 class ClockworkRNN(nn.Module, _BaseRNNMixin):
     """
-    Discrete-time Clockwork RNN with tanh/g voltage-based formulation.
+    Discrete-time Clockwork RNN with configurable activation.
 
     Modules are ordered fastest-to-slowest. The block-upper-triangular
     structural mask enforces that faster modules receive input only from
     themselves and slower modules (information flows slow-to-fast).
     At each timestep t, only units whose period evenly divides t are updated;
     the rest retain their previous state.
+
+    Always uses membrane_potential semantics; the view flag is ignored.
     """
 
     def __init__(self, input_size: int = 1, hidden_size: int = 64,
                  periods: tuple = (1, 2, 4, 8, 16, 32, 64, 128),
-                 g: float = 1.5, **kwargs):
+                 g: float = 1.5, activation: str = 'tanh', **kwargs):
         super().__init__()
+        periods = list(periods)
+        while len(periods) > 1 and hidden_size % len(periods) != 0:
+            periods = periods[:-1]
         n_modules = len(periods)
-        assert hidden_size % n_modules == 0, (
-            f"hidden_size ({hidden_size}) must be divisible by n_modules ({n_modules})"
-        )
         self.hidden_size = hidden_size
         self.g = g
+        self._init_activation(activation)
         units_per_module = hidden_size // n_modules
 
         # Map each hidden unit to its module's period (fastest to slowest)
@@ -445,14 +484,9 @@ class ClockworkRNN(nn.Module, _BaseRNNMixin):
         h_seq = []
 
         for t in range(seq_len):
-            # Units whose period evenly divides t are active at this step
-            active_mask = (t % self.unit_periods == 0).unsqueeze(0)  # (1, hidden_size)
-
-            # Proposed new state for all units (structural mask on W_rec)
-            h_new = (self.g * F.linear(torch.tanh(h), self.W_rec.weight * self.W_mask)
+            active_mask = (t % self.unit_periods == 0).unsqueeze(0)
+            h_new = (self.g * F.linear(self.act_fn(h), self.W_rec.weight * self.W_mask)
                      + self.W_in(x[:, t, :]) + self.bias)
-
-            # Only active units update; the rest keep their previous state
             h = torch.where(active_mask, h_new, h)
             h_seq.append(h)
 
@@ -460,6 +494,66 @@ class ClockworkRNN(nn.Module, _BaseRNNMixin):
         readout = self._readout(h_seq_tensor, return_sequence)
         if return_hidden:
             return readout, h_seq_tensor
+        return readout
+
+
+# =============================================================================
+# 8. Piecewise-Linear RNN (Durstewitz 2017)
+# =============================================================================
+
+class PLRNN(nn.Module, _BaseRNNMixin):
+    """
+    Piecewise-Linear RNN (Durstewitz, 2017).
+    z_t = A * z_{t-1} + W * act_fn(z_{t-1} - theta) + W_in * x_t + bias
+    A is a diagonal parameter (auto-regressive time constants).
+    W is a strictly off-diagonal recurrent weight matrix.
+
+    Always uses membrane_potential semantics; the view flag is ignored.
+    """
+
+    def __init__(self, input_size: int = 1, hidden_size: int = 64,
+                 activation: str = 'relu', **kwargs):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self._init_activation(activation)
+
+        # Diagonal auto-regressive weights (initialized near 1 for slow integration)
+        self.A = nn.Parameter(torch.empty(hidden_size).uniform_(0.5, 0.99))
+
+        # Off-diagonal recurrent weights
+        self.W_rec = nn.Linear(hidden_size, hidden_size, bias=False)
+        with torch.no_grad():
+            self.W_rec.weight.fill_diagonal_(0.0)
+        self.register_buffer('W_mask', 1.0 - torch.eye(hidden_size))
+
+        self.W_in = nn.Linear(input_size, hidden_size, bias=False)
+        self.bias = nn.Parameter(torch.zeros(hidden_size))
+        self.theta = nn.Parameter(torch.zeros(hidden_size))
+
+        self._init_shared(hidden_size)
+        self._init_weights()
+
+    def _init_weights(self):
+        std = 1.0 / math.sqrt(self.hidden_size)
+        nn.init.normal_(self.W_in.weight, 0, std)
+        nn.init.normal_(self.W_rec.weight, 0, std)
+
+    def forward(self, x: torch.Tensor, return_sequence: bool = True,
+                return_hidden: bool = False) -> torch.Tensor:
+        batch_size, seq_len, _ = x.shape
+        z = self._get_h0(batch_size)
+
+        z_seq = []
+        for t in range(seq_len):
+            phi_z = self.act_fn(z - self.theta)
+            lateral = F.linear(phi_z, self.W_rec.weight * self.W_mask)
+            z = self.A.clamp(0.0, 1.0) * z + lateral + self.W_in(x[:, t, :]) + self.bias
+            z_seq.append(z)
+
+        z_seq_tensor = torch.stack(z_seq, dim=1)
+        readout = self._readout(z_seq_tensor, return_sequence)
+        if return_hidden:
+            return readout, z_seq_tensor
         return readout
 
 
@@ -475,7 +569,11 @@ MODEL_REGISTRY = {
     'MultiPartitioned': MultiPartitionedCTRNN,
     'LearnablePartitioned': LearnablePartitionedCTRNN,
     'Clockwork': ClockworkRNN,
+    'PLRNN': PLRNN,
 }
+
+# Models that only support membrane_potential view
+MEMBRANE_ONLY_MODELS = {'Clockwork', 'PLRNN'}
 
 MODEL_COLORS = {
     'VanillaRNN': 'tab:blue',
@@ -485,16 +583,20 @@ MODEL_COLORS = {
     'MultiPartitioned': 'tab:purple',
     'LearnablePartitioned': 'tab:brown',
     'Clockwork': 'tab:cyan',
+    'PLRNN': 'tab:pink',
 }
 
 
 def build_model(name: str, input_size: int = 1, hidden_size: int = 64,
                 **kwargs) -> nn.Module:
     """Instantiate a model by name from the registry.
-    dt is silently dropped for VanillaRNN which has no continuous-time dynamics.
+    dt is silently dropped for models without continuous-time dynamics.
+    view is silently dropped for Clockwork and PLRNN.
     """
     if name not in MODEL_REGISTRY:
         raise ValueError(f"Unknown model '{name}'. Choose from: {list(MODEL_REGISTRY.keys())}")
-    if name in ('VanillaRNN', 'Clockwork'):
+    if name in ('VanillaRNN', 'Clockwork', 'PLRNN'):
         kwargs.pop('dt', None)
+    if name in MEMBRANE_ONLY_MODELS:
+        kwargs.pop('view', None)
     return MODEL_REGISTRY[name](input_size=input_size, hidden_size=hidden_size, **kwargs)

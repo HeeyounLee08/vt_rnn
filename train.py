@@ -8,7 +8,9 @@ Provides a unified Trainer class that handles:
 - Per-epoch loss tracking
 """
 
+import math
 import numpy as np
+from pathlib import Path
 from typing import Dict, List, Optional
 
 import torch
@@ -56,6 +58,7 @@ class Trainer:
         self.X_mean: Optional[np.ndarray] = None
         self.X_std: Optional[np.ndarray] = None
         self.train_losses: List[float] = []
+        self.diverged: bool = False
 
     def _normalize(self, X: np.ndarray, fit: bool = False) -> np.ndarray:
         if fit:
@@ -158,9 +161,15 @@ class Trainer:
                 loss.backward()
                 nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
                 optimizer.step()
+                self._clip_wrec_spectral_radius()
                 epoch_loss += loss.item()
 
             avg = epoch_loss / len(loader)
+            if not math.isfinite(avg):
+                if verbose:
+                    print(f"    *** NaN/Inf loss at epoch {epoch+1}, stopping training ***")
+                self.diverged = True
+                break
             self.train_losses.append(avg)
             scheduler.step(avg)
 
@@ -177,13 +186,55 @@ class Trainer:
 
         return self.train_losses
 
+    def _clip_wrec_spectral_radius(self, max_radius: float = 1.0):
+        """After each optimizer step, rescale W_rec if its spectral radius exceeds max_radius."""
+        if not hasattr(self.model, 'W_rec'):
+            return
+        with torch.no_grad():
+            W = self.model.W_rec.weight
+            if not torch.isfinite(W).all():
+                return  # NaN/Inf already present; training loop will catch it via loss check
+            sigma = torch.linalg.matrix_norm(W, ord=2)
+            if sigma > max_radius:
+                self.model.W_rec.weight.mul_(max_radius / sigma)
+
     @torch.no_grad()
     def predict(self, X: np.ndarray) -> np.ndarray:
         """Predict firing rates for input sequences. Returns (n, seq_len)."""
         X_norm = self._normalize(X, fit=False)
         self.model.eval()
         X_t = torch.FloatTensor(X_norm).to(self.device)
-        return self.model(X_t, return_sequence=True).cpu().numpy()
+        out = self.model(X_t, return_sequence=True).cpu().numpy()
+        return np.clip(np.nan_to_num(out, nan=0.0, posinf=1e6), 0, 1e6)
+
+    def save(self, path: Path):
+        """Save trainer state (model weights + normalisation stats + losses) to a .pt file."""
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        torch.save({
+            'model_state': self.model.state_dict(),
+            'X_mean':      self.X_mean,
+            'X_std':       self.X_std,
+            'train_losses': self.train_losses,
+            'lr':          self.lr,
+            'batch_size':  self.batch_size,
+            'tau_lr_multiplier': self.tau_lr_multiplier,
+        }, path)
+
+    @classmethod
+    def load(cls, path: Path, model: nn.Module, device: Optional[str] = None) -> 'Trainer':
+        """Load a saved trainer. The model architecture must already be constructed."""
+        ckpt = torch.load(path, map_location='cpu', weights_only=False)
+        trainer = cls(model,
+                      lr=ckpt.get('lr', 1e-3),
+                      batch_size=ckpt.get('batch_size', 64),
+                      device=device,
+                      tau_lr_multiplier=ckpt.get('tau_lr_multiplier', 1.0))
+        trainer.model.load_state_dict(ckpt['model_state'])
+        trainer.X_mean = ckpt['X_mean']
+        trainer.X_std  = ckpt['X_std']
+        trainer.train_losses = ckpt['train_losses']
+        return trainer
 
 
 def train_all_models(
