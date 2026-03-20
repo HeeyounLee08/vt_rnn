@@ -10,6 +10,8 @@ Models (all with configurable activation: tanh or relu):
 6. LearnablePartitionedCTRNN - CTRNN with learnable fast/slow partitions
 7. ClockworkRNN             - Clockwork RNN (Koutnik et al. 2014)
 8. PLRNN                    - Piecewise-Linear RNN (Durstewitz 2017)
+9. PureLogTauCTRNN          - CTRNN with log-space tau parameterisation
+10. PureLogPartitionedCTRNN  - CTRNN with log-space fast/slow partition
 
 Two hidden-state views (selectable via `view` parameter):
   membrane_potential: nonlinearity on recurrent input only; state integrates linearly
@@ -37,8 +39,10 @@ class _BaseRNNMixin:
         self.activation_name = activation_name.lower()
         if self.activation_name == 'relu':
             self.act_fn = torch.relu
+            self.default_g = 0.5   # lower gain for unbounded ReLU
         elif self.activation_name == 'tanh':
             self.act_fn = torch.tanh
+            self.default_g = 1.5   # higher gain for squashed tanh
         else:
             raise ValueError(f"Unsupported activation: {activation_name}")
 
@@ -58,13 +62,15 @@ class _BaseRNNMixin:
             return self.softplus(self.fc(h_seq[:, -1, :])).squeeze(-1)
 
     def _ctrnn_step(self, h, x_t, alpha):
-        """Single CTRNN Euler step, dispatched by self.view."""
+        """Single CTRNN Euler step, dispatched by self.view. State clamped to [-50, 50]."""
         if self.view == 'firing_rate':
             pre = self.g * self.W_rec(h) + self.W_in(x_t) + self.bias
-            return self.act_fn((1 - alpha) * h + alpha * pre)
-        # membrane_potential (default)
-        drive = self.g * self.W_rec(self.act_fn(h)) + self.W_in(x_t) + self.bias
-        return (1 - alpha) * h + alpha * drive
+            h = self.act_fn((1 - alpha) * h + alpha * pre)
+        else:
+            # membrane_potential (default)
+            drive = self.g * self.W_rec(self.act_fn(h)) + self.W_in(x_t) + self.bias
+            h = (1 - alpha) * h + alpha * drive
+        return torch.clamp(h, min=-50.0, max=50.0)
 
 
 # =============================================================================
@@ -105,6 +111,7 @@ class VanillaRNN(nn.Module, _BaseRNNMixin):
                 h = self.act_fn(self.W_in(x[:, t, :]) + self.W_rec(h) + self.bias)
             else:
                 h = self.W_in(x[:, t, :]) + self.W_rec(self.act_fn(h)) + self.bias
+            h = torch.clamp(h, min=-50.0, max=50.0)
             h_seq.append(h)
         h_seq_tensor = torch.stack(h_seq, dim=1)
         readout = self._readout(h_seq_tensor, return_sequence)
@@ -127,16 +134,16 @@ class LearnableTauCTRNN(nn.Module, _BaseRNNMixin):
 
     def __init__(self, input_size: int = 1, hidden_size: int = 64,
                  dt: float = 1.0, tau_min: float = 1.0, tau_max: float = 200.0,
-                 g: float = 1.5, activation: str = 'tanh',
+                 g: float = None, activation: str = 'tanh',
                  view: str = 'membrane_potential'):
         super().__init__()
         self.hidden_size = hidden_size
         self.dt = dt
         self.tau_min = tau_min
         self.tau_max = tau_max
-        self.g = g
         self.view = view
         self._init_activation(activation)
+        self.g = g if g is not None else self.default_g
 
         eps = 0.05
         u = torch.empty(hidden_size).uniform_(eps, 1.0 - eps)
@@ -187,14 +194,14 @@ class FixedSpectrumCTRNN(nn.Module, _BaseRNNMixin):
 
     def __init__(self, input_size: int = 1, hidden_size: int = 64,
                  dt: float = 1.0, tau_mean: float = 10.0, tau_std: float = 5.0,
-                 g: float = 1.5, activation: str = 'tanh',
+                 g: float = None, activation: str = 'tanh',
                  view: str = 'membrane_potential'):
         super().__init__()
         self.hidden_size = hidden_size
         self.dt = dt
-        self.g = g
         self.view = view
         self._init_activation(activation)
+        self.g = g if g is not None else self.default_g
 
         var = tau_std ** 2
         mu = math.log(tau_mean ** 2 / math.sqrt(var + tau_mean ** 2))
@@ -244,16 +251,16 @@ class PartitionedCTRNN(nn.Module, _BaseRNNMixin):
 
     def __init__(self, input_size: int = 1, hidden_size: int = 64,
                  dt: float = 1.0, tau_fast: float = 2.0, tau_slow: float = 50.0,
-                 fast_ratio: float = 0.5, g: float = 1.5, activation: str = 'tanh',
+                 fast_ratio: float = 0.5, g: float = None, activation: str = 'tanh',
                  view: str = 'membrane_potential'):
         super().__init__()
         self.hidden_size = hidden_size
         self.dt = dt
-        self.g = g
         self.n_fast = int(hidden_size * fast_ratio)
         self.n_slow = hidden_size - self.n_fast
         self.view = view
         self._init_activation(activation)
+        self.g = g if g is not None else self.default_g
 
         alpha = torch.cat([
             torch.full((self.n_fast,), dt / tau_fast),
@@ -304,15 +311,15 @@ class MultiPartitionedCTRNN(nn.Module, _BaseRNNMixin):
     def __init__(self, input_size: int = 1, hidden_size: int = 64,
                  dt: float = 1.0,
                  taus: tuple = (2.0, 25.0, 50.0, 75.0, 100.0),
-                 g: float = 1.5, activation: str = 'tanh',
+                 g: float = None, activation: str = 'tanh',
                  view: str = 'membrane_potential'):
         super().__init__()
         self.hidden_size = hidden_size
         self.dt = dt
-        self.g = g
         self.taus = taus
         self.view = view
         self._init_activation(activation)
+        self.g = g if g is not None else self.default_g
 
         n = len(taus)
         base, remainder = divmod(hidden_size, n)
@@ -367,18 +374,18 @@ class LearnablePartitionedCTRNN(nn.Module, _BaseRNNMixin):
     def __init__(self, input_size: int = 1, hidden_size: int = 64,
                  dt: float = 1.0, tau_min: float = 1.0, tau_max: float = 200.0,
                  init_tau_fast: float = 2.0, init_tau_slow: float = 50.0,
-                 fast_ratio: float = 0.5, g: float = 1.5, activation: str = 'tanh',
+                 fast_ratio: float = 0.5, g: float = None, activation: str = 'tanh',
                  view: str = 'membrane_potential'):
         super().__init__()
         self.hidden_size = hidden_size
         self.dt = dt
         self.tau_min = tau_min
         self.tau_max = tau_max
-        self.g = g
         self.n_fast = int(hidden_size * fast_ratio)
         self.n_slow = hidden_size - self.n_fast
         self.view = view
         self._init_activation(activation)
+        self.g = g if g is not None else self.default_g
 
         def _tau_to_rho(tau):
             p = (tau - tau_min) / (tau_max - tau_min)
@@ -441,15 +448,15 @@ class ClockworkRNN(nn.Module, _BaseRNNMixin):
 
     def __init__(self, input_size: int = 1, hidden_size: int = 64,
                  periods: tuple = (1, 2, 4, 8, 16, 32, 64, 128),
-                 g: float = 1.5, activation: str = 'tanh', **kwargs):
+                 g: float = None, activation: str = 'tanh', **kwargs):
         super().__init__()
         periods = list(periods)
         while len(periods) > 1 and hidden_size % len(periods) != 0:
             periods = periods[:-1]
         n_modules = len(periods)
         self.hidden_size = hidden_size
-        self.g = g
         self._init_activation(activation)
+        self.g = g if g is not None else self.default_g
         units_per_module = hidden_size // n_modules
 
         # Map each hidden unit to its module's period (fastest to slowest)
@@ -488,6 +495,7 @@ class ClockworkRNN(nn.Module, _BaseRNNMixin):
             h_new = (self.g * F.linear(self.act_fn(h), self.W_rec.weight * self.W_mask)
                      + self.W_in(x[:, t, :]) + self.bias)
             h = torch.where(active_mask, h_new, h)
+            h = torch.clamp(h, min=-50.0, max=50.0)
             h_seq.append(h)
 
         h_seq_tensor = torch.stack(h_seq, dim=1)
@@ -543,17 +551,140 @@ class PLRNN(nn.Module, _BaseRNNMixin):
         batch_size, seq_len, _ = x.shape
         z = self._get_h0(batch_size)
 
+        A_stable = self.A.clamp(0.0, 0.99)
         z_seq = []
         for t in range(seq_len):
             phi_z = self.act_fn(z - self.theta)
             lateral = F.linear(phi_z, self.W_rec.weight * self.W_mask)
-            z = self.A.clamp(0.0, 1.0) * z + lateral + self.W_in(x[:, t, :]) + self.bias
+            z = A_stable * z + lateral + self.W_in(x[:, t, :]) + self.bias
+            z = torch.clamp(z, min=-50.0, max=50.0)
             z_seq.append(z)
 
         z_seq_tensor = torch.stack(z_seq, dim=1)
         readout = self._readout(z_seq_tensor, return_sequence)
         if return_hidden:
             return readout, z_seq_tensor
+        return readout
+
+
+# =============================================================================
+# 9. Pure Log-Space Tau CTRNN
+# =============================================================================
+
+class PureLogTauCTRNN(nn.Module, _BaseRNNMixin):
+    """
+    CTRNN with log-space tau parameterisation: tau = exp(T).
+
+    Unlike sigmoid-based reparameterisation (LearnableTauCTRNN), the log-space
+    approach avoids vanishing gradients at extreme timescales, allowing the
+    network to learn very fast or very slow dynamics without hitting saturation.
+    """
+
+    def __init__(self, input_size: int = 1, hidden_size: int = 64,
+                 dt: float = 1.0, init_tau_min: float = 1.0, init_tau_max: float = 200.0,
+                 g: float = None, activation: str = 'tanh',
+                 view: str = 'membrane_potential'):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.dt = dt
+        self.view = view
+        self._init_activation(activation)
+        self.g = g if g is not None else self.default_g
+
+        # T = log(tau), so tau = exp(T). Init uniform in tau-space.
+        init_taus = torch.empty(hidden_size).uniform_(init_tau_min, init_tau_max)
+        self.T = nn.Parameter(torch.log(init_taus))
+
+        self.W_in = nn.Linear(input_size, hidden_size, bias=False)
+        self.W_rec = nn.Linear(hidden_size, hidden_size, bias=False)
+        self.bias = nn.Parameter(torch.zeros(hidden_size))
+        self._init_shared(hidden_size)
+        self._init_weights()
+
+    def _init_weights(self):
+        nn.init.normal_(self.W_rec.weight, 0, 1.0 / math.sqrt(self.hidden_size))
+        nn.init.normal_(self.W_in.weight, 0, 1.0 / math.sqrt(self.hidden_size))
+
+    def get_alpha(self) -> torch.Tensor:
+        tau = torch.exp(torch.clamp(self.T, min=-10, max=10))
+        return torch.clamp(self.dt / tau, max=1.0)
+
+    def forward(self, x: torch.Tensor, return_sequence: bool = True,
+                return_hidden: bool = False) -> torch.Tensor:
+        batch_size, seq_len, _ = x.shape
+        h = self._get_h0(batch_size)
+        alpha = self.get_alpha()
+        h_seq = []
+        for t in range(seq_len):
+            h = self._ctrnn_step(h, x[:, t, :], alpha)
+            h_seq.append(h)
+
+        h_seq_tensor = torch.stack(h_seq, dim=1)
+        readout = self._readout(h_seq_tensor, return_sequence)
+        if return_hidden:
+            return readout, h_seq_tensor
+        return readout
+
+
+# =============================================================================
+# 10. Pure Log-Space Partitioned CTRNN
+# =============================================================================
+
+class PureLogPartitionedCTRNN(nn.Module, _BaseRNNMixin):
+    """
+    CTRNN with two log-space tau parameters: one for fast, one for slow compartment.
+
+    Combines the structural fast/slow prior of PartitionedCTRNN with
+    the gradient-friendly log-space parameterisation of PureLogTauCTRNN.
+    """
+
+    def __init__(self, input_size: int = 1, hidden_size: int = 64,
+                 dt: float = 1.0, init_tau_fast: float = 2.0, init_tau_slow: float = 50.0,
+                 fast_ratio: float = 0.5, g: float = None, activation: str = 'tanh',
+                 view: str = 'membrane_potential'):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.dt = dt
+        self.n_fast = int(hidden_size * fast_ratio)
+        self.n_slow = hidden_size - self.n_fast
+        self.view = view
+        self._init_activation(activation)
+        self.g = g if g is not None else self.default_g
+
+        self.T_fast = nn.Parameter(torch.log(torch.tensor(float(init_tau_fast))))
+        self.T_slow = nn.Parameter(torch.log(torch.tensor(float(init_tau_slow))))
+
+        self.W_in = nn.Linear(input_size, hidden_size, bias=False)
+        self.W_rec = nn.Linear(hidden_size, hidden_size, bias=False)
+        self.bias = nn.Parameter(torch.zeros(hidden_size))
+        self._init_shared(hidden_size)
+        self._init_weights()
+
+    def _init_weights(self):
+        nn.init.normal_(self.W_rec.weight, 0, 1.0 / math.sqrt(self.hidden_size))
+        nn.init.normal_(self.W_in.weight, 0, 1.0 / math.sqrt(self.hidden_size))
+
+    def get_alpha(self) -> torch.Tensor:
+        tau_fast = torch.exp(torch.clamp(self.T_fast, min=-10, max=10))
+        tau_slow = torch.exp(torch.clamp(self.T_slow, min=-10, max=10))
+        alpha_fast = torch.clamp(self.dt / tau_fast, max=1.0).expand(self.n_fast)
+        alpha_slow = torch.clamp(self.dt / tau_slow, max=1.0).expand(self.n_slow)
+        return torch.cat([alpha_fast, alpha_slow])
+
+    def forward(self, x: torch.Tensor, return_sequence: bool = True,
+                return_hidden: bool = False) -> torch.Tensor:
+        batch_size, seq_len, _ = x.shape
+        h = self._get_h0(batch_size)
+        alpha = self.get_alpha()
+        h_seq = []
+        for t in range(seq_len):
+            h = self._ctrnn_step(h, x[:, t, :], alpha)
+            h_seq.append(h)
+
+        h_seq_tensor = torch.stack(h_seq, dim=1)
+        readout = self._readout(h_seq_tensor, return_sequence)
+        if return_hidden:
+            return readout, h_seq_tensor
         return readout
 
 
@@ -570,6 +701,8 @@ MODEL_REGISTRY = {
     'LearnablePartitioned': LearnablePartitionedCTRNN,
     'Clockwork': ClockworkRNN,
     'PLRNN': PLRNN,
+    'PureLogTau': PureLogTauCTRNN,
+    'PureLogPartitioned': PureLogPartitionedCTRNN,
 }
 
 # Models that only support membrane_potential view
@@ -584,6 +717,8 @@ MODEL_COLORS = {
     'LearnablePartitioned': 'tab:brown',
     'Clockwork': 'tab:cyan',
     'PLRNN': 'tab:pink',
+    'PureLogTau': '#e6ab02',
+    'PureLogPartitioned': '#66a61e',
 }
 
 
