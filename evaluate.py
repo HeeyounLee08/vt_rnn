@@ -18,6 +18,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 from pathlib import Path
 from scipy.ndimage import gaussian_filter1d
+from scipy.stats import wasserstein_distance
 from typing import Dict, List, Optional, Tuple
 
 from models import MODEL_COLORS
@@ -51,11 +52,35 @@ def _poisson_nll(y_pred: np.ndarray, y_true: np.ndarray,
     return per_step.mean()
 
 
+def _get_isis(spike_array: np.ndarray,
+              lengths: Optional[np.ndarray] = None) -> np.ndarray:
+    """
+    Compute ISIs (in bins) from a batched spike array (n, T).
+    Respects lengths mask so padded zeros are excluded.
+    Returns flat array of ISI values; empty if fewer than 2 spikes total.
+    """
+    spike_array = np.asarray(spike_array)
+    if spike_array.ndim == 1:
+        spike_array = spike_array[None]
+
+    all_isis = []
+    for i in range(spike_array.shape[0]):
+        L = int(lengths[i]) if lengths is not None else spike_array.shape[1]
+        row = spike_array[i, :L]
+        # repeat index for multi-spike bins
+        spike_times = np.repeat(np.arange(L), row.astype(int))
+        if len(spike_times) >= 2:
+            all_isis.append(np.diff(spike_times).astype(float))
+
+    return np.concatenate(all_isis) if all_isis else np.array([])
+
+
 def evaluate_trainer(trainer,
                      X_test: np.ndarray,
                      y_test: np.ndarray,
                      lengths_test: Optional[np.ndarray] = None,
-                     smooth_sigma: float = 15.0) -> dict:
+                     smooth_sigma: float = 15.0,
+                     n_isi_samples: int = 10) -> dict:
     """
     Compute evaluation metrics for a single trainer on held-out test data.
 
@@ -67,7 +92,7 @@ def evaluate_trainer(trainer,
         smooth_sigma: Gaussian sigma (bins) for smoothing GT before Pearson r
 
     Returns:
-        dict with keys: test_nll, bps, pearson_r, mean_rate_err
+        dict with keys: test_nll, bps, pearson_r, mean_rate_err, isi_wasserstein
     """
     y_pred = trainer.predict(X_test)  # (n, T)
 
@@ -88,8 +113,10 @@ def evaluate_trainer(trainer,
 
     # --- BPS ---
     n_spikes = y_test.sum()
+    # Use valid timestep count (excluding padding) to match _poisson_nll's masked mean
+    n_valid = int(lengths_test.sum()) if lengths_test is not None else y_test.size
     if n_spikes > 0:
-        bps = (baseline_nll - test_nll) / (n_spikes / y_test.size) / np.log(2)
+        bps = (baseline_nll - test_nll) / (n_spikes / n_valid) / np.log(2)
     else:
         bps = np.nan
 
@@ -109,11 +136,24 @@ def evaluate_trainer(trainer,
     pred_mean = y_pred.mean() if lengths_test is None else y_pred[mask].mean()
     mean_rate_err = abs(pred_mean - mean_rate) / (mean_rate + 1e-8)
 
+    # --- ISI Wasserstein distance (averaged over n_isi_samples Poisson draws) ---
+    true_isis = _get_isis(y_test, lengths_test)
+    if len(true_isis) >= 2:
+        dists = []
+        for _ in range(n_isi_samples):
+            sim_isis = _get_isis(np.random.poisson(y_pred), lengths_test)
+            if len(sim_isis) >= 2:
+                dists.append(wasserstein_distance(true_isis, sim_isis))
+        isi_wasserstein = float(np.mean(dists)) if dists else np.nan
+    else:
+        isi_wasserstein = np.nan
+
     return {
-        'test_nll':      float(test_nll),
-        'bps':           float(bps),
-        'pearson_r':     float(pearson_r),
-        'mean_rate_err': float(mean_rate_err),
+        'test_nll':        float(test_nll),
+        'bps':             float(bps),
+        'pearson_r':       float(pearson_r),
+        'mean_rate_err':   float(mean_rate_err),
+        'isi_wasserstein': isi_wasserstein,
     }
 
 
@@ -186,18 +226,20 @@ def plot_metric_heatmap(df: pd.DataFrame, metric: str = 'bps',
     nrows = (n_grid + ncols - 1) // ncols
 
     metric_label = {
-        'bps': 'Bits per spike',
-        'test_nll': 'Test NLL',
-        'pearson_r': 'Pearson r',
-        'mean_rate_err': 'Mean rate error',
+        'bps':             'Bits per spike',
+        'test_nll':        'Test NLL',
+        'pearson_r':       'Pearson r',
+        'mean_rate_err':   'Mean rate error',
+        'isi_wasserstein': 'ISI Wasserstein Dist.',
     }.get(metric, metric)
 
     # Scientific colour maps: diverging for signed metrics, sequential for error/NLL
     _CMAPS = {
-        'bps':           'PRGn',       # purple–green diverging
-        'pearson_r':     'PuOr',       # purple–orange diverging
-        'test_nll':      'plasma_r',   # sequential, lower = better
-        'mean_rate_err': 'YlOrRd',     # sequential, lower = better
+        'bps':             'PRGn',     # purple–green diverging
+        'pearson_r':       'PuOr',     # purple–orange diverging
+        'test_nll':        'plasma_r', # sequential, lower = better
+        'mean_rate_err':   'YlOrRd',   # sequential, lower = better
+        'isi_wasserstein': 'magma_r',  # sequential, lower = better
     }
     cmap = _CMAPS.get(metric, 'viridis')
 
