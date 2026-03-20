@@ -68,12 +68,13 @@ AVAILABLE_TYPES = [1, 2, 3, 4, 5, 6, 7, 8, 9, 11, 12, 13, 14, 15, 16, 18, 19, 20
 # Parallel worker
 # =============================================================================
 
-def _train_single_model_worker(ct, mname, X, y, lengths, hidden_size, tau_lr_multiplier, activation='tanh', view='membrane_potential'):
+def _train_single_model_worker(ct, mname, X, y, lengths, hidden_size, tau_lr_multiplier, activation='tanh', view='membrane_potential', aux_variance_gamma=0.0):
     """Train a single (cell_type, model, grid_point) tuple — designed for joblib dispatch."""
     model = build_model(mname, input_size=1, hidden_size=hidden_size, dt=BIN_SIZE_MS, activation=activation, view=view)
     trainer = Trainer(model, lr=LR, batch_size=BATCH_SIZE, device='cpu',
                       tau_lr_multiplier=tau_lr_multiplier)
-    trainer.fit(X, y, n_epochs=N_EPOCHS, lengths=lengths, verbose=False)
+    trainer.fit(X, y, n_epochs=N_EPOCHS, lengths=lengths, verbose=False,
+                aux_variance_gamma=aux_variance_gamma)
     return (ct, mname, hidden_size, tau_lr_multiplier, trainer)
 
 
@@ -139,6 +140,8 @@ def main():
     parser.add_argument('--view', type=str, choices=['membrane_potential', 'firing_rate'],
                         default='membrane_potential',
                         help='Hidden state update view (default: membrane_potential)')
+    parser.add_argument('--aux_variance_gamma', type=float, default=0.0,
+                        help='Auxiliary temporal variance penalty weight (default: 0.0 = disabled)')
     args = parser.parse_args()
 
     # Parse cell types
@@ -229,6 +232,7 @@ def main():
                 trainers = train_all_models(
                     models, X, y, lengths=lengths, n_epochs=N_EPOCHS, lr=LR,
                     batch_size=BATCH_SIZE, verbose=True, tau_lr_multiplier=tau_lr,
+                    aux_variance_gamma=args.aux_variance_gamma,
                 )
                 trainers_by_config[(hidden_size, tau_lr)][ct] = trainers
                 if args.save_models:
@@ -245,7 +249,7 @@ def main():
         print(f"\nDispatching {n_tasks_total} jobs with joblib (n_jobs={args.n_jobs})...")
         results = Parallel(n_jobs=args.n_jobs, verbose=10)(
             delayed(_train_single_model_worker)(
-                ct, mname, train_data[ct][0], train_data[ct][1], train_data[ct][2], hs, tlr, args.activation, args.view
+                ct, mname, train_data[ct][0], train_data[ct][1], train_data[ct][2], hs, tlr, args.activation, args.view, args.aux_variance_gamma
             )
             for ct, mname, hs, tlr in all_tasks
         )
