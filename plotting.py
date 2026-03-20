@@ -264,6 +264,37 @@ def plot_tau_distributions(trainers: Dict, cell_type: int, plot_root: Path = Non
             ax.set_ylabel('# units')
             ax.set_title(f'{name}\n[learnable, 2 params]', fontsize=9)
 
+        elif name == 'PureLogTau':
+            with torch.no_grad():
+                alpha = model.get_alpha().cpu().numpy()
+            taus = model.dt / alpha
+            taus = taus[np.isfinite(taus)]
+            if len(taus) == 0:
+                ax.text(0.5, 0.5, 'No finite τ', ha='center', va='center',
+                        transform=ax.transAxes, fontsize=12, color='gray')
+                ax.set_axis_off()
+            else:
+                ax.hist(taus, bins=20, color=color, alpha=0.8, edgecolor='k', lw=0.5)
+                ax.axvline(taus.mean(), color='k', ls='--', lw=1.2,
+                           label=f'mean={taus.mean():.1f}ms')
+                ax.set_xlabel('τ (ms)')
+                ax.set_ylabel('# units')
+                ax.legend(fontsize=8)
+            ax.set_title(f'{name}\n[log-space, per-unit]', fontsize=9)
+
+        elif name == 'PureLogPartitioned':
+            with torch.no_grad():
+                alpha = model.get_alpha().cpu().numpy()
+            taus = model.dt / alpha
+            tau_fast = taus[:model.n_fast]
+            tau_slow = taus[model.n_fast:]
+            ax.bar([f'Fast\n(τ={tau_fast[0]:.1f}ms)',
+                    f'Slow\n(τ={tau_slow[0]:.1f}ms)'],
+                   [model.n_fast, model.n_slow],
+                   color=[color, '#b2df8a'], edgecolor='k', lw=0.8)
+            ax.set_ylabel('# units')
+            ax.set_title(f'{name}\n[log-space, 2 params]', fontsize=9)
+
         ax.grid(alpha=0.2)
 
     plt.tight_layout()
@@ -395,7 +426,7 @@ def plot_hidden_activations(trainer, I_binned: np.ndarray, y_binned: np.ndarray,
     ax_out.set_yticks([0.5, 1.5])
     ax_out.set_yticklabels(['Pred', 'GT'], fontsize=8)
     ax_out_r = ax_out.twinx()
-    gt_smooth = gaussian_filter1d(y_binned.astype(float), sigma=1)
+    gt_smooth = gaussian_filter1d(y_binned.astype(float), sigma=1.5)
     ax_out_r.plot(t, gt_smooth, color='k', lw=1.2, alpha=0.55, linestyle='-',
                   label='GT (smoothed)')
     ax_out_r.plot(t, y_pred, color=color, lw=1.2, alpha=0.5, linestyle='--',
@@ -449,27 +480,35 @@ def plot_isi_distributions(trainers: Dict, test_trials: list,
     if len(all_vals) < 2:
         return
 
+    from scipy.ndimage import gaussian_filter1d
+
     x_max = np.percentile(all_vals, 98)
     bins = np.linspace(0, x_max, 80)
+    bin_centers = 0.5 * (bins[:-1] + bins[1:])
+    smooth_sigma = 2.0
+
+    def _smooth_density(isis):
+        counts, _ = np.histogram(isis, bins=bins, density=True)
+        return gaussian_filter1d(counts.astype(float), sigma=smooth_sigma)
 
     fig, ax = plt.subplots(figsize=(10, 5))
 
     if len(gt_isis) >= 2:
-        ax.hist(gt_isis, bins=bins, density=True,
-                color='#333333', alpha=0.30, hatch='',
-                edgecolor='#333333', linewidth=1.2,
-                label=f'Ground Truth (n={len(gt_isis)})',
-                zorder=len(trainers) + 2)
+        sm = _smooth_density(gt_isis)
+        ax.fill_between(bin_centers, sm, alpha=0.25, color='#333333',
+                        hatch='', zorder=len(trainers) + 2)
+        ax.plot(bin_centers, sm, color='#333333', linewidth=1.8,
+                label=f'Ground Truth (n={len(gt_isis)})', zorder=len(trainers) + 2)
 
     for i, (name, isis) in enumerate(model_isis.items()):
         color = MODEL_COLORS.get(name, 'gray')
         hatch = _ISI_HATCHES[i % len(_ISI_HATCHES)]
         if len(isis) >= 2:
-            ax.hist(isis, bins=bins, density=True,
-                    color=color, alpha=0.35, hatch=hatch,
-                    edgecolor=color, linewidth=0.6,
-                    label=f'{name} (n={len(isis)})',
-                    zorder=i + 1)
+            sm = _smooth_density(isis)
+            ax.fill_between(bin_centers, sm, alpha=0.18, color=color,
+                            hatch=hatch, zorder=i + 1)
+            ax.plot(bin_centers, sm, color=color, linewidth=1.4,
+                    label=f'{name} (n={len(isis)})', zorder=i + 1)
 
     ax.set_xlim(0, x_max)
     ax.set_xlabel('ISI (bins)', fontsize=10)
