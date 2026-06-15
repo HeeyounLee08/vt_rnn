@@ -146,13 +146,15 @@ def main():
     # Regenerate training data with the original seed
     print("\nRegenerating training data...")
     train_data = {}
+    test_data  = {}
     for ct in cell_types:
         ct_name = index_to_name.get(ct, f'Type {ct}')
         print(f"  Cell type {ct} ({ct_name})...")
         X, y, lengths = generate_training_data(
             ct, n_trials=N_TRIALS, bin_size_ms=BIN_SIZE_MS, seed=SEED, verbose=True,
         )
-        train_data[ct] = (X, y, lengths)
+        train_data[ct] = (X[:-N_TEST_TRIALS], y[:-N_TEST_TRIALS], lengths[:-N_TEST_TRIALS])
+        test_data[ct]  = (X[-N_TEST_TRIALS:], y[-N_TEST_TRIALS:], lengths[-N_TEST_TRIALS:])
 
     # Group entries: by_va[(view, act)][(hs, tlr)][ct][mname] = path
     by_va = defaultdict(lambda: defaultdict(lambda: defaultdict(dict)))
@@ -197,7 +199,7 @@ def main():
         # Evaluate and save metrics
         if trainers_by_config:
             print(f"\n  Evaluating...")
-            df = evaluate_all(trainers_by_config, train_data)
+            df = evaluate_all(trainers_by_config, test_data)
             for (hs, tlr) in trainers_by_config:
                 run_tag   = f"h{hs}_tlr{tlr}"
                 plot_root = act_root / run_tag

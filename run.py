@@ -184,13 +184,15 @@ def main():
     # ---- Generate training data once (independent of grid) ----
     print("Generating training data...")
     train_data = {}
+    test_data  = {}
     for ct in valid_types:
         ct_name = index_to_name.get(ct, f'Type {ct}')
         print(f"  Cell type {ct} ({ct_name})...")
         X, y, lengths = generate_training_data(
             ct, n_trials=N_TRIALS, bin_size_ms=BIN_SIZE_MS, seed=SEED, verbose=True,
         )
-        train_data[ct] = (X, y, lengths)
+        train_data[ct] = (X[:-N_TEST_TRIALS], y[:-N_TEST_TRIALS], lengths[:-N_TEST_TRIALS])
+        test_data[ct]  = (X[-N_TEST_TRIALS:], y[-N_TEST_TRIALS:], lengths[-N_TEST_TRIALS:])
 
     # ---- Load or train across full grid ----
     start_time = time.perf_counter()
@@ -285,7 +287,7 @@ def main():
 
     # ---- Evaluate ----
     print("\nEvaluating models...")
-    df = evaluate_all(trainers_by_config, train_data)
+    df = evaluate_all(trainers_by_config, test_data)
 
     # Save per-grid-point CSVs and heatmaps — each goes into its own run_tag directory
     for (hs, tlr) in trainers_by_config:

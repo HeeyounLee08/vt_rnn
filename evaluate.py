@@ -164,16 +164,13 @@ def evaluate_trainer(trainer,
 def evaluate_all(
     trainers_by_config: dict,
     test_data: Dict[int, Tuple[np.ndarray, np.ndarray, np.ndarray]],
-    n_test_trials: int = 20,
 ) -> pd.DataFrame:
     """
     Evaluate all trained models.
 
     Args:
         trainers_by_config: {(hs, tlr): {ct: {mname: Trainer}}}
-        test_data:          {ct: (X, y, lengths)}  — training data reused as proxy;
-                            evaluation uses held-out slices (last n_test_trials)
-        n_test_trials:      how many trials to hold out for evaluation
+        test_data:          {ct: (X, y, lengths)}  — held-out trials never seen during training
 
     Returns:
         Tidy DataFrame with columns:
@@ -182,11 +179,7 @@ def evaluate_all(
     rows = []
     for (hs, tlr), by_ct in trainers_by_config.items():
         for ct, trainers in by_ct.items():
-            X, y, lengths = test_data[ct]
-            # Use last n_test_trials as a held-out evaluation set
-            X_eval = X[-n_test_trials:]
-            y_eval = y[-n_test_trials:]
-            l_eval = lengths[-n_test_trials:]
+            X_eval, y_eval, l_eval = test_data[ct]
 
             for mname, trainer in trainers.items():
                 metrics = evaluate_trainer(trainer, X_eval, y_eval, l_eval)
