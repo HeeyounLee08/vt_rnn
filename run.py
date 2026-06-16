@@ -135,7 +135,7 @@ def main():
                         help='Disable model saving')
     parser.add_argument('--skip_training', action='store_true', default=False,
                         help='Load saved models instead of training (requires prior --save_models run)')
-    parser.add_argument('--activation', type=str, choices=['tanh', 'relu'], default='tanh',
+    parser.add_argument('--activation', type=str, choices=['tanh', 'relu', 'softplus'], default='tanh',
                         help='Activation function for RNN models (default: tanh)')
     parser.add_argument('--view', type=str, choices=['membrane_potential', 'firing_rate'],
                         default='membrane_potential',

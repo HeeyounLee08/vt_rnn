@@ -1,7 +1,7 @@
 """
 models.py - RNN architectures for fitting Izhikevich neuron dynamics.
 
-Models (all with configurable activation: tanh or relu):
+Models (all with configurable activation: tanh, relu, or softplus):
 1. VanillaRNN               - Standard Elman RNN
 2. LearnableTauCTRNN        - CTRNN with learnable time constants
 3. FixedSpectrumCTRNN       - CTRNN with fixed log-normal timescale distribution
@@ -43,6 +43,9 @@ class _BaseRNNMixin:
         elif self.activation_name == 'tanh':
             self.act_fn = torch.tanh
             self.default_g = 1.5   # higher gain for squashed tanh
+        elif self.activation_name == 'softplus':
+            self.act_fn = F.softplus
+            self.default_g = 0.5   # unbounded like ReLU
         else:
             raise ValueError(f"Unsupported activation: {activation_name}")
 
