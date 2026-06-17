@@ -68,14 +68,16 @@ AVAILABLE_TYPES = [1, 2, 3, 4, 5, 6, 7, 8, 9, 11, 12, 13, 14, 15, 16, 18, 19, 20
 # Parallel worker
 # =============================================================================
 
-def _train_single_model_worker(ct, mname, X, y, lengths, hidden_size, tau_lr_multiplier, activation='tanh', view='membrane_potential', aux_variance_gamma=0.0):
-    """Train a single (cell_type, model, grid_point) tuple — designed for joblib dispatch."""
+def _train_single_model_worker(ct, mname, X, y, lengths, hidden_size, tau_lr_multiplier, activation='tanh', view='membrane_potential', aux_variance_gamma=0.0, seed=42):
+    """Train a single (cell_type, model, grid_point, seed) tuple — designed for joblib dispatch."""
+    torch.manual_seed(seed)
+    np.random.seed(seed)
     model = build_model(mname, input_size=1, hidden_size=hidden_size, dt=BIN_SIZE_MS, activation=activation, view=view)
     trainer = Trainer(model, lr=LR, batch_size=BATCH_SIZE, device='cpu',
                       tau_lr_multiplier=tau_lr_multiplier)
     trainer.fit(X, y, n_epochs=N_EPOCHS, lengths=lengths, verbose=False,
                 aux_variance_gamma=aux_variance_gamma)
-    return (ct, mname, hidden_size, tau_lr_multiplier, trainer)
+    return (ct, mname, hidden_size, tau_lr_multiplier, seed, trainer)
 
 
 # =============================================================================
@@ -142,6 +144,8 @@ def main():
                         help='Hidden state update view (default: membrane_potential)')
     parser.add_argument('--aux_variance_gamma', type=float, default=0.0,
                         help='Auxiliary temporal variance penalty weight (default: 0.0 = disabled)')
+    parser.add_argument('--seeds', type=int, nargs='+', default=[42],
+                        help='Random seeds for model init (e.g. --seeds 0 1 2 3 4)')
     args = parser.parse_args()
 
     # Parse cell types
@@ -159,7 +163,7 @@ def main():
     active_models = {k: v for k, v in MODEL_REGISTRY.items()
                      if args.view == 'membrane_potential' or k not in MEMBRANE_ONLY_MODELS}
 
-    grid = list(itertools.product(args.hidden_size, args.tau_lr_multiplier))
+    grid = list(itertools.product(args.hidden_size, args.tau_lr_multiplier, args.seeds))
     n_models = len(active_models)
     n_tasks_per_point = len(valid_types) * n_models
     n_tasks_total = n_tasks_per_point * len(grid)
@@ -168,14 +172,18 @@ def main():
     print(f"Models:              {list(active_models.keys())}")
     print(f"hidden_size grid:    {args.hidden_size}")
     print(f"tau_lr_mult grid:    {args.tau_lr_multiplier}")
+    print(f"Seeds:               {args.seeds}")
     print(f"Activation:          {args.activation}")
     print(f"View:                {args.view}")
-    print(f"Grid points:         {len(grid)}  ({args.hidden_size} x {args.tau_lr_multiplier})")
+    print(f"Grid points:         {len(grid)}  ({args.hidden_size} x {args.tau_lr_multiplier} x {args.seeds})")
     print(f"Total tasks:         {n_tasks_total}  ({n_tasks_per_point} per grid point)")
     print(f"Mode:                {args.mode} (n_jobs={args.n_jobs})\n")
 
     act_root = PLOT_ROOT / args.view / args.activation
     model_act_root = MODEL_ROOT / args.view / args.activation
+
+    def _run_tag(hs, tlr, seed) -> str:
+        return f"h{hs}_tlr{tlr}_seed{seed}"
 
     def _model_path(run_tag, ct, mname) -> Path:
         ct_name = index_to_name.get(ct, f'type_{ct}').lower().replace(' ', '_')
@@ -200,11 +208,11 @@ def main():
 
     if args.skip_training:
         print("\nLoading saved models...")
-        for hidden_size, tau_lr in grid:
-            run_tag = f"h{hidden_size}_tlr{tau_lr}"
-            trainers_by_config[(hidden_size, tau_lr)] = {}
+        for hidden_size, tau_lr, seed in grid:
+            run_tag = _run_tag(hidden_size, tau_lr, seed)
+            trainers_by_config[(hidden_size, tau_lr, seed)] = {}
             for ct in valid_types:
-                trainers_by_config[(hidden_size, tau_lr)][ct] = {}
+                trainers_by_config[(hidden_size, tau_lr, seed)][ct] = {}
                 for mname in active_models:
                     path = _model_path(run_tag, ct, mname)
                     if not path.exists():
@@ -213,20 +221,22 @@ def main():
                         )
                     model = build_model(mname, input_size=1, hidden_size=hidden_size, dt=BIN_SIZE_MS, activation=args.activation, view=args.view)
                     trainer = Trainer.load(path, model, device='cpu')
-                    trainers_by_config[(hidden_size, tau_lr)][ct][mname] = trainer
+                    trainers_by_config[(hidden_size, tau_lr, seed)][ct][mname] = trainer
                     print(f"  Loaded {run_tag}/ct{ct}/{mname}")
 
     elif args.mode == 'sequential':
-        for hidden_size, tau_lr in grid:
-            run_tag = f"h{hidden_size}_tlr{tau_lr}"
+        for hidden_size, tau_lr, seed in grid:
+            run_tag = _run_tag(hidden_size, tau_lr, seed)
             print(f"\n{'='*60}")
-            print(f"  Grid point: hidden_size={hidden_size}, tau_lr_multiplier={tau_lr}")
+            print(f"  Grid point: hidden_size={hidden_size}, tau_lr_multiplier={tau_lr}, seed={seed}")
             print(f"{'='*60}")
-            trainers_by_config[(hidden_size, tau_lr)] = {}
+            trainers_by_config[(hidden_size, tau_lr, seed)] = {}
             for ct in valid_types:
                 X, y, lengths = train_data[ct]
                 ct_name = index_to_name.get(ct, f'Type {ct}')
                 print(f"\n  --- Cell Type {ct}: {ct_name} ---")
+                torch.manual_seed(seed)
+                np.random.seed(seed)
                 models = {mname: build_model(mname, input_size=1, hidden_size=hidden_size, dt=BIN_SIZE_MS, activation=args.activation, view=args.view)
                           for mname in active_models}
                 for mname, m in models.items():
@@ -236,31 +246,31 @@ def main():
                     batch_size=BATCH_SIZE, verbose=True, tau_lr_multiplier=tau_lr,
                     aux_variance_gamma=args.aux_variance_gamma,
                 )
-                trainers_by_config[(hidden_size, tau_lr)][ct] = trainers
+                trainers_by_config[(hidden_size, tau_lr, seed)][ct] = trainers
                 if args.save_models:
                     for mname, trainer in trainers.items():
                         trainer.save(_model_path(run_tag, ct, mname))
 
     else:  # parallel — dispatch ALL grid × cell × model tasks at once
         all_tasks = [
-            (ct, mname, hs, tlr)
-            for hs, tlr in grid
+            (ct, mname, hs, tlr, seed)
+            for hs, tlr, seed in grid
             for ct in valid_types
             for mname in active_models
         ]
         print(f"\nDispatching {n_tasks_total} jobs with joblib (n_jobs={args.n_jobs})...")
         results = Parallel(n_jobs=args.n_jobs, verbose=10)(
             delayed(_train_single_model_worker)(
-                ct, mname, train_data[ct][0], train_data[ct][1], train_data[ct][2], hs, tlr, args.activation, args.view, args.aux_variance_gamma
+                ct, mname, train_data[ct][0], train_data[ct][1], train_data[ct][2], hs, tlr, args.activation, args.view, args.aux_variance_gamma, seed
             )
-            for ct, mname, hs, tlr in all_tasks
+            for ct, mname, hs, tlr, seed in all_tasks
         )
-        for ct, mname, hs, tlr, trainer in results:
-            trainers_by_config.setdefault((hs, tlr), {}).setdefault(ct, {})[mname] = trainer
+        for ct, mname, hs, tlr, seed, trainer in results:
+            trainers_by_config.setdefault((hs, tlr, seed), {}).setdefault(ct, {})[mname] = trainer
         if args.save_models:
             print("\nSaving models...")
-            for (hs, tlr), by_ct in trainers_by_config.items():
-                run_tag = f"h{hs}_tlr{tlr}"
+            for (hs, tlr, seed), by_ct in trainers_by_config.items():
+                run_tag = _run_tag(hs, tlr, seed)
                 for ct, trainers in by_ct.items():
                     for mname, trainer in trainers.items():
                         trainer.save(_model_path(run_tag, ct, mname))
@@ -276,8 +286,8 @@ def main():
 
     # ---- Plot (one directory per grid point) ----
     print("\nGenerating plots...")
-    for (hidden_size, tau_lr), trainers_by_ct in trainers_by_config.items():
-        run_tag = f"h{hidden_size}_tlr{tau_lr}"
+    for (hidden_size, tau_lr, seed), trainers_by_ct in trainers_by_config.items():
+        run_tag = _run_tag(hidden_size, tau_lr, seed)
         plot_root = act_root / run_tag
         print(f"\n  [{run_tag}]")
         for ct in valid_types:
@@ -290,11 +300,11 @@ def main():
     df = evaluate_all(trainers_by_config, test_data)
 
     # Save per-grid-point CSVs and heatmaps — each goes into its own run_tag directory
-    for (hs, tlr) in trainers_by_config:
-        run_tag = f"h{hs}_tlr{tlr}"
+    for (hs, tlr, seed) in trainers_by_config:
+        run_tag = _run_tag(hs, tlr, seed)
         plot_root = act_root / run_tag
         plot_root.mkdir(parents=True, exist_ok=True)
-        sub = df[(df['hidden_size'] == hs) & (df['tau_lr'] == tlr)]
+        sub = df[(df['hidden_size'] == hs) & (df['tau_lr'] == tlr) & (df['seed'] == seed)]
         csv_path = plot_root / 'metrics.csv'
         sub.to_csv(csv_path, index=False)
         print(f"  Saved: {csv_path}")

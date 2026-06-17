@@ -169,15 +169,15 @@ def evaluate_all(
     Evaluate all trained models.
 
     Args:
-        trainers_by_config: {(hs, tlr): {ct: {mname: Trainer}}}
+        trainers_by_config: {(hs, tlr, seed): {ct: {mname: Trainer}}}
         test_data:          {ct: (X, y, lengths)}  — held-out trials never seen during training
 
     Returns:
         Tidy DataFrame with columns:
-            hidden_size, tau_lr, cell_type, model, test_nll, bps, pearson_r, mean_rate_err
+            hidden_size, tau_lr, seed, cell_type, model, test_nll, bps, pearson_r, mean_rate_err
     """
     rows = []
-    for (hs, tlr), by_ct in trainers_by_config.items():
+    for (hs, tlr, seed), by_ct in trainers_by_config.items():
         for ct, trainers in by_ct.items():
             X_eval, y_eval, l_eval = test_data[ct]
 
@@ -186,6 +186,7 @@ def evaluate_all(
                 rows.append({
                     'hidden_size': hs,
                     'tau_lr':      tlr,
+                    'seed':        seed,
                     'cell_type':   ct,
                     'cell_name':   index_to_name.get(ct, f'Type {ct}'),
                     'model':       mname,
