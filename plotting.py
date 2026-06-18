@@ -522,6 +522,180 @@ def plot_isi_distributions(trainers: Dict, test_trials: list,
     _save(fig, get_plot_dir(cell_type, plot_root) / 'isi_distributions.png')
 
 
+def plot_predicted_rate_curves(trainers: Dict, test_trials: list,
+                               cell_type: int, plot_root: Path = None,
+                               zoom_bins: int = 200):
+    """
+    Show the raw predicted firing-rate curves (y_pred) for each model alongside
+    the ground-truth spike train on every test trial.
+
+    Two panels per trial column:
+      - top: GT spike raster + smoothed GT rate
+      - per-model rows: raw y_pred (no Poisson sampling, no smoothing)
+
+    A zoom inset shows the first `zoom_bins` bins so ~27-bin oscillations are
+    visible without being compressed.
+    """
+    n_models = len(trainers)
+    n_trials = len(test_trials)
+    n_rows = n_models + 1
+
+    fig, axes = plt.subplots(n_rows, n_trials,
+                             figsize=(5 * n_trials, 2.5 * n_rows),
+                             squeeze=False)
+
+    for col, (I_binned, y_binned) in enumerate(test_trials):
+        T = len(I_binned)
+        t = np.arange(T)
+        X_test = I_binned.reshape(1, -1, 1)
+        gt_times = np.where(y_binned > 0)[0]
+        gt_smooth = gaussian_filter1d(y_binned.astype(float), sigma=3.0)
+
+        ax0 = axes[0, col]
+        ax0.vlines(gt_times, 0, 1, color='k', lw=1.2, alpha=0.7)
+        ax0.set_ylim(0, 1.2)
+        ax0.set_yticks([])
+        ax0_r = ax0.twinx()
+        ax0_r.plot(t, gt_smooth, color='k', lw=1.2, alpha=0.6)
+        ax0_r.set_ylabel('Rate', fontsize=7)
+        ax0_r.set_ylim(bottom=0)
+        ax0_r.tick_params(labelsize=7)
+        ax0.set_title(f'Trial {col + 1}', fontsize=9)
+        if col == 0:
+            ax0.set_ylabel('Ground Truth', fontsize=8, fontweight='bold')
+
+        for i, (name, trainer) in enumerate(trainers.items()):
+            ax = axes[i + 1, col]
+            color = MODEL_COLORS.get(name, 'gray')
+            y_pred = trainer.predict(X_test)[0]
+
+            ax.plot(t, y_pred, color=color, lw=1.1)
+            ax.plot(t, gt_smooth, color='k', lw=0.8, alpha=0.35, linestyle='--')
+            ax.set_ylim(bottom=0)
+            ax.set_ylabel(name if col == 0 else '', fontsize=8)
+            ax.grid(alpha=0.2)
+
+        axes[-1, col].set_xlabel('Time (bins)')
+
+    fig.suptitle(
+        f'Predicted Rate Curves — Cell Type {cell_type}\n'
+        f'(solid = model rate, dashed = smoothed GT)',
+        fontweight='bold', y=1.01,
+    )
+    plt.tight_layout()
+    _save(fig, get_plot_dir(cell_type, plot_root) / 'predicted_rate_curves.png')
+
+    # --- Zoom plot: first zoom_bins of trial 0 so ~27-bin rhythm is legible ---
+    I_binned0, y_binned0 = test_trials[0]
+    T0 = min(zoom_bins, len(I_binned0))
+    t0 = np.arange(T0)
+    X_test0 = I_binned0.reshape(1, -1, 1)
+    gt_smooth0 = gaussian_filter1d(y_binned0[:T0].astype(float), sigma=3.0)
+    gt_times0 = np.where(y_binned0[:T0] > 0)[0]
+
+    fig2, axes2 = plt.subplots(n_models + 1, 1,
+                                figsize=(14, 2.2 * (n_models + 1)),
+                                sharex=True)
+
+    ax0z = axes2[0]
+    ax0z.vlines(gt_times0, 0, 1, color='k', lw=1.3)
+    ax0z.set_ylim(0, 1.2)
+    ax0z.set_yticks([])
+    ax0z_r = ax0z.twinx()
+    ax0z_r.plot(t0, gt_smooth0, color='k', lw=1.2, alpha=0.6)
+    ax0z_r.set_ylim(bottom=0)
+    ax0z_r.set_ylabel('Rate', fontsize=7)
+    ax0z.set_ylabel('Ground Truth', fontsize=9, fontweight='bold')
+    ax0z.set_title(f'Rate Zoom (first {T0} bins) — Cell Type {cell_type}',
+                   fontweight='bold')
+
+    for i, (name, trainer) in enumerate(trainers.items()):
+        ax = axes2[i + 1]
+        color = MODEL_COLORS.get(name, 'gray')
+        y_pred = trainer.predict(X_test0)[0][:T0]
+        ax.plot(t0, y_pred, color=color, lw=1.2, label=name)
+        ax.plot(t0, gt_smooth0, color='k', lw=0.8, alpha=0.35, linestyle='--')
+        ax.set_ylim(bottom=0)
+        ax.set_ylabel(name, fontsize=8)
+        ax.grid(alpha=0.2)
+
+    axes2[-1].set_xlabel('Time (bins)')
+    plt.tight_layout()
+    _save(fig2, get_plot_dir(cell_type, plot_root) / 'predicted_rate_zoom.png')
+
+
+def plot_rate_autocorrelation(trainers: Dict, test_trials: list,
+                              cell_type: int, plot_root: Path = None,
+                              max_lag: int = 100, expected_period: int = 27):
+    """
+    Autocorrelation of the predicted firing rate for each model, averaged across
+    test trials. Compared to the GT autocorrelation (from smoothed spike trains).
+
+    A peak at lag `expected_period` means the model's rate oscillates at that
+    period — i.e., the model locked onto the limit-cycle rhythm, not just the
+    mean rate.
+    """
+    def _acf(signal: np.ndarray, max_lag: int) -> np.ndarray:
+        """Normalized autocorrelation at lags 1..max_lag (lag-0 excluded)."""
+        x = signal - signal.mean()
+        var = (x ** 2).mean()
+        if var < 1e-12:
+            return np.zeros(max_lag)
+        T = len(x)
+        result = np.array([
+            (x[:T - k] * x[k:]).mean() / var
+            for k in range(1, max_lag + 1)
+        ])
+        return result
+
+    lags = np.arange(1, max_lag + 1)
+
+    # GT autocorrelation: use Gaussian-smoothed spike train so sparsity doesn't
+    # kill the signal — same sigma used throughout (3 bins ≈ 3 ms)
+    gt_acfs = []
+    for _, y_binned in test_trials:
+        gt_smooth = gaussian_filter1d(y_binned.astype(float), sigma=3.0)
+        gt_acfs.append(_acf(gt_smooth, max_lag))
+    gt_acf_mean = np.mean(gt_acfs, axis=0)
+
+    model_acfs = {}
+    for name, trainer in trainers.items():
+        trial_acfs = []
+        for I_binned, _ in test_trials:
+            y_pred = trainer.predict(I_binned.reshape(1, -1, 1))[0]
+            trial_acfs.append(_acf(y_pred, max_lag))
+        model_acfs[name] = np.mean(trial_acfs, axis=0)
+
+    fig, ax = plt.subplots(figsize=(10, 5))
+
+    ax.plot(lags, gt_acf_mean, color='k', lw=2.2, label='Ground Truth (smoothed)',
+            zorder=len(trainers) + 2)
+    ax.fill_between(lags, 0, gt_acf_mean, color='k', alpha=0.08,
+                    zorder=len(trainers) + 1)
+
+    for i, (name, acf) in enumerate(model_acfs.items()):
+        color = MODEL_COLORS.get(name, 'gray')
+        ax.plot(lags, acf, color=color, lw=1.6, label=name, zorder=i + 1)
+
+    # Mark expected period
+    ax.axvline(expected_period, color='crimson', lw=1.2, linestyle='--', alpha=0.8,
+               label=f'Expected period ({expected_period} bins)')
+    ax.axhline(0, color='k', lw=0.6, alpha=0.4)
+
+    ax.set_xlim(1, max_lag)
+    ax.set_xlabel('Lag (bins)', fontsize=10)
+    ax.set_ylabel('Autocorrelation', fontsize=10)
+    ax.set_title(
+        f'Rate Autocorrelation — Cell Type {cell_type}\n'
+        f'Peak at lag {expected_period} = model learned the limit-cycle rhythm',
+        fontsize=10, fontweight='bold',
+    )
+    ax.legend(ncol=2, fontsize=8, framealpha=0.85)
+    ax.grid(alpha=0.25)
+    plt.tight_layout()
+    _save(fig, get_plot_dir(cell_type, plot_root) / 'rate_autocorrelation.png')
+
+
 def plot_clean_comparison(trainers: Dict, I_binned: np.ndarray,
                           y_binned: np.ndarray, cell_type: int, plot_root: Path = None):
     """
