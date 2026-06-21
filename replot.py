@@ -29,8 +29,7 @@ from data import generate_training_data, generate_test_trial, generate_clean_tes
 from train import Trainer
 from plotting import (PLOT_ROOT, plot_training_data, plot_loss_curves, plot_test_predictions,
                       plot_tau_distributions, plot_clean_comparison, plot_hidden_activations,
-                      plot_isi_distributions, plot_predicted_rate_curves,
-                      plot_rate_autocorrelation)
+                      plot_isi_distributions, plot_rate_autocorrelation)
 from evaluate import evaluate_all, plot_metric_heatmap
 from izhikevich_configs import index_to_name
 
@@ -47,11 +46,12 @@ RESULTS_ROOT = Path(__file__).parent / 'results'
 # ── Path parsing ──────────────────────────────────────────────────────────────
 
 def _parse_run_tag(tag: str):
-    """'h64_tlr5.0' → (64, 5.0)"""
-    m = re.fullmatch(r'h(\d+)_tlr(.+)', tag)
+    """'h64_tlr5.0' → (64, 5.0, SEED)   'h128_tlr1.0_seed42' → (128, 1.0, 42)"""
+    m = re.fullmatch(r'h(\d+)_tlr([\d.]+)(?:_seed(\d+))?', tag)
     if not m:
         raise ValueError(f"Unexpected run_tag: {tag!r}")
-    return int(m.group(1)), float(m.group(2))
+    seed = int(m.group(3)) if m.group(3) else SEED
+    return int(m.group(1)), float(m.group(2)), seed
 
 
 def _parse_ct_dir(name: str):
@@ -65,7 +65,7 @@ def _parse_ct_dir(name: str):
 def scan_models(view=None, activation=None, hidden_sizes=None):
     """
     Scan models/ and return a list of entries, each a dict:
-      {view, activation, hidden_size, tau_lr, cell_type, model_name, path}
+      {view, activation, hidden_size, tau_lr, seed, run_tag, cell_type, model_name, path}
     All arguments act as optional filters.
     """
     entries = []
@@ -76,7 +76,7 @@ def scan_models(view=None, activation=None, hidden_sizes=None):
             if len(parts) != 5:
                 continue
             v, act, run_tag, ct_dir, fname = parts
-            hs, tlr = _parse_run_tag(run_tag)
+            hs, tlr, seed = _parse_run_tag(run_tag)
             ct = _parse_ct_dir(ct_dir)
         except Exception:
             continue
@@ -87,7 +87,7 @@ def scan_models(view=None, activation=None, hidden_sizes=None):
 
         entries.append(dict(
             view=v, activation=act,
-            hidden_size=hs, tau_lr=tlr,
+            hidden_size=hs, tau_lr=tlr, seed=seed, run_tag=run_tag,
             cell_type=ct, model_name=Path(fname).stem,
             path=pt,
         ))
@@ -106,7 +106,6 @@ def _run_plots(trainers, X, y, lengths, cell_type, plot_root):
         print(f"      trial {k+1}: {len(Ib)} bins, {int(yb.sum())} spikes")
     plot_test_predictions(trainers, test_trials, cell_type, plot_root=plot_root)
     plot_isi_distributions(trainers, test_trials, cell_type, plot_root=plot_root)
-    plot_predicted_rate_curves(trainers, test_trials, cell_type, plot_root=plot_root)
     plot_rate_autocorrelation(trainers, test_trials, cell_type, plot_root=plot_root)
     plot_tau_distributions(trainers, cell_type, plot_root=plot_root)
 
@@ -140,11 +139,11 @@ def main():
 
     va_pairs   = sorted(set((e['view'], e['activation']) for e in entries))
     cell_types = sorted(set(e['cell_type'] for e in entries))
-    grid_pts   = sorted(set((e['hidden_size'], e['tau_lr']) for e in entries))
+    grid_pts   = sorted(set((e['hidden_size'], e['tau_lr'], e['seed']) for e in entries))
     print(f"Found {len(entries)} saved model files")
-    print(f"  View/activation pairs : {va_pairs}")
-    print(f"  Cell types            : {cell_types}")
-    print(f"  Grid points (h, τ_lr) : {grid_pts}")
+    print(f"  View/activation pairs    : {va_pairs}")
+    print(f"  Cell types               : {cell_types}")
+    print(f"  Grid points (h, τ_lr, s) : {grid_pts}")
 
     # Regenerate training data with the original seed
     print("\nRegenerating training data...")
@@ -159,10 +158,13 @@ def main():
         train_data[ct] = (X[:-N_TEST_TRIALS], y[:-N_TEST_TRIALS], lengths[:-N_TEST_TRIALS])
         test_data[ct]  = (X[-N_TEST_TRIALS:], y[-N_TEST_TRIALS:], lengths[-N_TEST_TRIALS:])
 
-    # Group entries: by_va[(view, act)][(hs, tlr)][ct][mname] = path
+    # Group entries: by_va[(view, act)][(hs, tlr, seed)][ct][mname] = (path, run_tag)
     by_va = defaultdict(lambda: defaultdict(lambda: defaultdict(dict)))
+    run_tag_for = {}  # (view, act, hs, tlr, seed) → original run_tag directory name
     for e in entries:
-        by_va[(e['view'], e['activation'])][(e['hidden_size'], e['tau_lr'])][e['cell_type']][e['model_name']] = e['path']
+        key = (e['hidden_size'], e['tau_lr'], e['seed'])
+        by_va[(e['view'], e['activation'])][key][e['cell_type']][e['model_name']] = e['path']
+        run_tag_for[(e['view'], e['activation'], *key)] = e['run_tag']
 
     # Process each (view, activation) group independently
     for (view, act), by_grid in sorted(by_va.items()):
@@ -173,8 +175,8 @@ def main():
 
         trainers_by_config = defaultdict(dict)  # for evaluate_all
 
-        for (hs, tlr), by_ct in sorted(by_grid.items()):
-            run_tag   = f"h{hs}_tlr{tlr}"
+        for (hs, tlr, seed), by_ct in sorted(by_grid.items()):
+            run_tag   = run_tag_for[(view, act, hs, tlr, seed)]
             plot_root = act_root / run_tag
             print(f"\n  [{run_tag}]")
 
@@ -195,7 +197,7 @@ def main():
                 if not trainers:
                     continue
 
-                trainers_by_config[(hs, tlr)][ct] = trainers
+                trainers_by_config[(hs, tlr, seed)][ct] = trainers
                 X, y, lengths = train_data[ct]
                 _run_plots(trainers, X, y, lengths, ct, plot_root)
 
@@ -203,11 +205,11 @@ def main():
         if trainers_by_config:
             print(f"\n  Evaluating...")
             df = evaluate_all(trainers_by_config, test_data)
-            for (hs, tlr) in trainers_by_config:
-                run_tag   = f"h{hs}_tlr{tlr}"
+            for (hs, tlr, seed) in trainers_by_config:
+                run_tag   = run_tag_for[(view, act, hs, tlr, seed)]
                 plot_root = act_root / run_tag
                 plot_root.mkdir(parents=True, exist_ok=True)
-                sub = df[(df['hidden_size'] == hs) & (df['tau_lr'] == tlr)]
+                sub = df[(df['hidden_size'] == hs) & (df['tau_lr'] == tlr) & (df['seed'] == seed)]
                 csv_path = plot_root / 'metrics.csv'
                 sub.to_csv(csv_path, index=False)
                 print(f"  Saved: {csv_path}")
