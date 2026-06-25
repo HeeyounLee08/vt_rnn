@@ -29,7 +29,7 @@ from data import generate_training_data, generate_test_trial, generate_clean_tes
 from train import Trainer
 from plotting import (PLOT_ROOT, plot_training_data, plot_loss_curves, plot_test_predictions,
                       plot_tau_distributions, plot_clean_comparison, plot_hidden_activations,
-                      plot_isi_distributions, plot_rate_autocorrelation)
+                      plot_isi_distributions, plot_rate_autocorrelation, plot_rate_comparison)
 from evaluate import evaluate_all, plot_metric_heatmap
 from izhikevich_configs import index_to_name
 
@@ -117,6 +117,7 @@ def _run_plots(trainers, X, y, lengths, cell_type, plot_root):
     )
     print(f"      clean trial: {len(I_clean)} bins, {int(y_clean.sum())} spikes")
     plot_clean_comparison(trainers, I_clean, y_clean, cell_type, plot_root=plot_root)
+    plot_rate_comparison(trainers, I_clean, y_clean, cell_type, plot_root=plot_root)
     for mname, trainer in trainers.items():
         plot_hidden_activations(trainer, I_clean, y_clean, cell_type, mname,
                                 plot_root=plot_root)

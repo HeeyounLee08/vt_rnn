@@ -594,6 +594,48 @@ def plot_rate_autocorrelation(trainers: Dict, test_trials: list,
     _save(fig, get_plot_dir(cell_type, plot_root) / 'rate_autocorrelation.png')
 
 
+def plot_rate_comparison(trainers: Dict, I_binned: np.ndarray,
+                        y_binned: np.ndarray, cell_type: int, plot_root: Path = None):
+    """
+    One row per model: GT smoothed rate (black) vs model predicted rate (colored).
+    Top row: input stimulus.
+    """
+    n_models = len(trainers)
+    t = np.arange(len(I_binned))
+    X_test = I_binned.reshape(1, -1, 1)
+    gt_smooth = gaussian_filter1d(y_binned.astype(float), sigma=1.5)
+
+    fig, axes = plt.subplots(
+        n_models + 1, 1,
+        figsize=(14, 2.0 * (n_models + 1)),
+        sharex=True,
+        gridspec_kw={'height_ratios': [0.8] + [1] * n_models},
+    )
+
+    ax_stim = axes[0]
+    ax_stim.plot(t, I_binned, color='cornflowerblue', lw=1.2)
+    ax_stim.set_ylabel('Input', fontsize=9)
+    ax_stim.set_title(f'Rate Comparison — Cell Type {cell_type}', fontweight='bold')
+    ax_stim.spines['bottom'].set_visible(False)
+    ax_stim.tick_params(bottom=False)
+
+    for i, (name, trainer) in enumerate(trainers.items()):
+        ax = axes[i + 1]
+        color = MODEL_COLORS.get(name, 'gray')
+        y_pred = trainer.predict(X_test)[0]
+
+        ax.plot(t, gt_smooth, color='k', lw=1.2, alpha=0.6, label='GT')
+        ax.plot(t, y_pred, color=color, lw=1.2, alpha=0.85, label=name)
+        ax.set_ylabel(name, fontsize=8, fontweight='bold')
+        ax.set_ylim(bottom=0)
+        ax.legend(fontsize=7, loc='upper right', framealpha=0.7)
+        ax.grid(axis='x', alpha=0.2)
+
+    axes[-1].set_xlabel('Time (bins)')
+    plt.tight_layout()
+    _save(fig, get_plot_dir(cell_type, plot_root) / 'rate_comparison.png')
+
+
 def plot_clean_comparison(trainers: Dict, I_binned: np.ndarray,
                           y_binned: np.ndarray, cell_type: int, plot_root: Path = None):
     """
